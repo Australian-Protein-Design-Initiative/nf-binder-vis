@@ -1,0 +1,17 @@
+services:
+  streamlit:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - ${RESULTS_PATH:-./results}:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    working_dir: /app
+    command: [ "--server.port=8501", "--server.address=0.0.0.0", "--", "--path", "/data" ]
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8501/_stcore/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
