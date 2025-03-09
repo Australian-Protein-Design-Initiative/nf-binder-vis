@@ -4,3 +4,5 @@ seaborn==0.13.2
 matplotlib==3.8.2
 streamlit-molstar
 altair>=5.2.0
+# streamlit-file-browser is installed locally from the cloned repository
+# to handle the npm dependencies

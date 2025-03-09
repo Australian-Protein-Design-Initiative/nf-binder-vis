@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nf-binder-vis"
+version = "0.1.0"
+description = "Results visualization for the nf-binder-design project"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Andrew Perry"}
+]
+dependencies = [
+    "streamlit>=1.32.0",
+    "pandas==2.2.0",
+    "seaborn==0.13.2",
+    "matplotlib==3.8.2",
+    "streamlit-molstar",
+    "altair>=5.2.0",
+    # The streamlit-file-browser package is installed locally to handle npm dependencies
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "isort",
+    "flake8",
+]
+
+[project.scripts]
+nf-binder-vis = "nf_binder_vis.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app.py"]
+
+[tool.hatch.metadata]
+allow-direct-references = true 

@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "altair>=5.2.0",
+#     "matplotlib==3.8.2",
+#     "pandas==2.2.0",
+#     "seaborn==0.13.2",
+#     "streamlit>=1.32.0",
+#     "streamlit-file-browser",
+#     "streamlit-molstar",
+# ]
+# ///
 
 import sys
 from pathlib import Path
@@ -10,6 +22,7 @@ import matplotlib.pyplot as plt
 import altair as alt
 from typing import Optional, List
 from streamlit_molstar import st_molstar
+from streamlit_file_browser import st_file_browser
 
 
 def parse_score_file(file_path: Path) -> Optional[pd.DataFrame]:
@@ -42,7 +55,7 @@ def load_data(path: Path) -> Optional[pd.DataFrame]:
         st.error(f"Path {path} does not exist")
         return None
 
-    cs_files = list(path.glob("**/*.cs"))
+    cs_files = list((path / "af2_initial_guess").glob("*.cs"))
     if not cs_files:
         st.error(f"No .cs files found in {path}")
         return None
@@ -137,11 +150,34 @@ def main():
     )
     args = parser.parse_args()
 
-    # Sidebar for path input
-    path_input = st.sidebar.text_input("Results Directory Path", value=args.path)
-    path = Path(path_input)
+    # Initialize session state for path if not exists
+    if "current_path" not in st.session_state:
+        st.session_state["current_path"] = Path(args.path)
 
-    df = load_data(path)
+    # Sidebar for path input
+    with st.sidebar:
+        st.header("Select run folder")
+        file_select_event = st_file_browser(
+            st.session_state.current_path,
+            show_preview=False,
+            show_download_file=True,
+            key="run_selector",
+        )
+
+        # Update path if a new folder is selected
+        if file_select_event and file_select_event["type"] == "SELECT_FOLDER":
+            selected_path = file_select_event.get("target", {}).get("path")
+            st.write(selected_path)
+            if selected_path:
+                # Create absolute path from the selected path
+                st.session_state["current_path"] = Path(
+                    args.path, selected_path
+                ).resolve()
+
+    st.info("Run path: " + str(st.session_state["current_path"]))
+
+    # Use the current path from session state
+    df = load_data(st.session_state.current_path)
     if df is None:
         return
 
@@ -231,7 +267,12 @@ def main():
     # Function to show the molecular viewer
     def show_structure(description: str):
         if description:
-            pdb_path = path / "af2_initial_guess" / "pdbs" / f"{description}.pdb"
+            pdb_path = (
+                st.session_state.current_path
+                / "af2_initial_guess"
+                / "pdbs"
+                / f"{description}.pdb"
+            )
             if pdb_path.exists():
                 st_molstar(str(pdb_path), key="mol_viewer", height="800px")
             else:
@@ -257,4 +298,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from streamlit.web import cli as stcli
+    from streamlit import runtime
+    import sys
+
+    if runtime.exists():
+        main()
+    else:
+        sys.argv = ["streamlit", "run", sys.argv[0]]
+        sys.exit(stcli.main())
+
+    # main()

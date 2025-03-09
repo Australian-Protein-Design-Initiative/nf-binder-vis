@@ -2,15 +2,33 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including Node.js and npm
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
 COPY requirements.txt /app/
+# Install other requirements
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the local streamlit-file-browser package
+COPY streamlit-file-browser /app/streamlit-file-browser
+# Or clone the remote version
+# RUN git clone https://github.com/pansapiens/streamlit-file-browser.git /app/streamlit-file-browser
+
+# Install npm dependencies for streamlit-file-browser and build
+RUN cd /app/streamlit-file-browser/streamlit_file_browser/frontend && \
+    npm install --legacy-peer-deps && \
+    export NODE_OPTIONS=--openssl-legacy-provider && \
+    npm run build && \
+    cd /app
+
+# Install streamlit-file-browser directly from local copy
+RUN pip install --no-cache-dir --force-reinstall ./streamlit-file-browser
 
 # Copy app code
 COPY . /app/
