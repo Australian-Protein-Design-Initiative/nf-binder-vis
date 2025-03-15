@@ -26,8 +26,8 @@ The streamlit-file-browser component requires Node.js dependencies:
 # You'll need npm - if you don't have an npm/node installation, do
 # curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
 # source ~/.bashrc
-# nvm install --lts node
-# nvm use --lts node
+# nvm install node
+# nvm use  node
 
 # Install Node.js dependencies
 cd streamlit-file-browser/streamlit_file_browser/frontend/
@@ -84,22 +84,32 @@ This will use the local version of streamlit-file-browser with its Node.js depen
 
 Open http://localhost:8501/
 
-### Using Docker
+
+## Building a Docker/Apptainer Image
 
 ```bash
-RESULTS_PATH=/path/to/results docker compose up -d --build
+docker build -t nf-binder-vis:latest .
+apptainer build nf-binder-vis.sif docker-daemon://nf-binder-vis:latest
+```
+
+### Running with Apptainer
+
+```bash
+apptainer run nf-binder-vis.sif --server.port 8502 -- --path /path/to/results
+```
+> The `--server.port` flag can be used to change the default port. Note the bare `--` before the `--path` flag - this is not a typo.
+
+Open http://localhost:8502/
+
+### Running with Docker
+
+```bash
+docker run -it --rm -v /abs/path/to/results:/results nf-binder-vis:latest -- --path /results
 ```
 
 Open http://localhost:8501/
 
-## Building
 
-### Docker Image
-
-```bash
-docker build -t nf-binder-vis .
-apptainer build nf-binder-vis.sif docker-daemon://nf-binder-vis:latest
-```
 
 ## TODO
 

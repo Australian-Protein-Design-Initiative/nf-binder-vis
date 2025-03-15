@@ -3,11 +3,11 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "altair>=5.2.0",
-#     "matplotlib==3.8.2",
-#     "pandas==2.2.0",
-#     "seaborn==0.13.2",
+#     "matplotlib",
+#     "pandas",
+#     "seaborn",
 #     "streamlit>=1.32.0",
-#     "streamlit-file-browser",
+#     "streamlit-file-browser @ git+https://github.com/pansapiens/streamlit-file-browser@symlinks",
 #     "streamlit-molstar",
 # ]
 # ///
@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import altair as alt
 from typing import Optional, List
 from streamlit_molstar import st_molstar
+
 from streamlit_file_browser import st_file_browser
 
 
@@ -55,42 +56,40 @@ def load_data(path: Path) -> Optional[pd.DataFrame]:
         st.error(f"Path {path} does not exist")
         return None
 
-    cs_files = list((path / "af2_initial_guess").glob("*.cs"))
-    if not cs_files:
-        st.error(f"No .cs files found in {path}")
-        return None
+    # First check if combined scores file exists
+    combined_file = path / "combined_scores.tsv"
+    if combined_file.exists():
+        st.info(f"Found combined scores file: {combined_file}")
+        try:
+            combined_df = pd.read_csv(combined_file, sep="\t")
+            # Automatically convert to best possible dtypes
+            combined_df = combined_df.convert_dtypes()
+            return combined_df
+        except Exception as e:
+            st.warning(
+                f"Error loading combined scores file: {str(e)}. Falling back to individual .cs files."
+            )
 
-    st.info(f"Found {len(cs_files)} .cs files")
+    else:
+        # If no combined file was found, fall back to parsing individual .cs files
+        # new location in af2_initial_guess/scores/
+        cs_files = list((path / "af2_initial_guess" / "scores").glob("*.cs"))
+        # DEPRECATED old location
+        cs_files.extend(list((path / "af2_initial_guess").glob("*.cs")))
+        if not cs_files:
+            st.warning(f"No .cs files found in {path}")
+        else:
+            st.info(f"Found {len(cs_files)} .cs files")
+            dfs = []
+            for file_path in cs_files:
+                df = parse_score_file(file_path)
+                if df is not None:
+                    dfs.append(df)
 
-    dfs = []
-    for file_path in cs_files:
-        df = parse_score_file(file_path)
-        if df is not None:
-            dfs.append(df)
-
-    if not dfs:
-        st.error("No valid data found in any of the .cs files")
-        return None
-
-    combined_df = pd.concat(dfs, ignore_index=True)
-
-    numeric_columns = [
-        "binder_aligned_rmsd",
-        "pae_binder",
-        "pae_interaction",
-        "pae_target",
-        "plddt_binder",
-        "plddt_target",
-        "plddt_total",
-        "target_aligned_rmsd",
-        "time",
-    ]
-
-    for col in numeric_columns:
-        if col in combined_df.columns:
-            combined_df[col] = pd.to_numeric(combined_df[col], errors="coerce")
-
-    return combined_df
+            combined_df = pd.concat(dfs, ignore_index=True)
+            # Automatically convert to best possible dtypes
+            combined_df = combined_df.convert_dtypes()
+            return combined_df
 
 
 def plot_distribution(df: pd.DataFrame, metrics: List[str]) -> None:
@@ -259,7 +258,7 @@ def main():
         selected_metrics = st.multiselect(
             "Select metrics for distribution plots",
             options=numeric_cols,
-            default=["pae_interaction", "pae_binder", "plddt_binder"],
+            default=["pae_interaction", "pae_binder", "plddt_binder", "rg"],
         )
         if selected_metrics:
             plot_distribution(df, selected_metrics)
@@ -298,14 +297,25 @@ def main():
 
 
 if __name__ == "__main__":
-    from streamlit.web import cli as stcli
-    from streamlit import runtime
-    import sys
+    main()
 
-    if runtime.exists():
-        main()
-    else:
-        sys.argv = ["streamlit", "run", sys.argv[0]]
-        sys.exit(stcli.main())
+    ###
+    # We cannot run this way - custom components fail to load
+    ###
 
-    # main()
+    # import os
+    # import sys
+
+    # # Disable Streamlit telemetry
+    # os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+    # os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+
+    # from streamlit.web import cli as stcli
+    # from streamlit import runtime
+
+    # if runtime.exists():
+    #     main()
+    # else:
+    #     # Pass through all arguments including --path
+    #     sys.argv = ["streamlit", "run", sys.argv[0]] + ["--"] + sys.argv[1:]
+    #     sys.exit(stcli.main())

@@ -11,24 +11,29 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
-COPY requirements.txt /app/
+COPY pyproject.toml /app/
+COPY README.md /app/
+
 # Install other requirements
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir .[all]
 
 # Copy the local streamlit-file-browser package
-COPY streamlit-file-browser /app/streamlit-file-browser
+# COPY streamlit-file-browser /app/streamlit-file-browser
 # Or clone the remote version
-# RUN git clone https://github.com/pansapiens/streamlit-file-browser.git /app/streamlit-file-browser
+RUN git clone https://github.com/pansapiens/streamlit-file-browser.git /app/streamlit-file-browser
 
 # Install npm dependencies for streamlit-file-browser and build
 RUN cd /app/streamlit-file-browser/streamlit_file_browser/frontend && \
     npm install --legacy-peer-deps && \
     export NODE_OPTIONS=--openssl-legacy-provider && \
     npm run build && \
+    cd ../.. && \
+    python setup.py sdist && \
     cd /app
 
 # Install streamlit-file-browser directly from local copy
-RUN pip install --no-cache-dir --force-reinstall ./streamlit-file-browser
+RUN pip install --no-cache-dir --force-reinstall \
+    ./streamlit-file-browser/dist/streamlit-file-browser-*.tar.gz
 
 # Copy app code
 COPY . /app/
@@ -39,5 +44,10 @@ EXPOSE 8501
 # Add healthcheck
 HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
 
-# Run streamlit (without args - they'll come from docker-compose)
-ENTRYPOINT ["streamlit", "run", "/app/app.py"] 
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+ENV STREAMLIT_SERVER_HEADLESS=true
+
+WORKDIR /app
+
+# Run streamlit app
+ENTRYPOINT ["streamlit", "run", "/app/app.py"]
