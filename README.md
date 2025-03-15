@@ -1,6 +1,6 @@
 # nf-binder-vis
 
-Results visualization for the nf-binder-design project.
+Results visualization for the nf-binder-design workflow.
 
 
 ## Installation
