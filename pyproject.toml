@@ -20,7 +20,7 @@ dependencies = [
     "streamlit-molstar",
     "altair>=5.2.0",
     # The streamlit-file-browser package is installed locally to handle npm dependencies
-    "streamlit-file-browser @ git+https://github.com/pansapiens/streamlit-file-browser@symlinks"
+    # "streamlit-file-browser @ git+https://github.com/pansapiens/streamlit-file-browser@symlinks"
 ]
 
 [project.optional-dependencies]

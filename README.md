@@ -57,12 +57,28 @@ export PATH=~/.local/bin:${PATH}
 uv venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
+# Clean out any old streamlit-file-browser versions and cache
+uv pip uninstall streamlit-file-browser || true # Allow failure if not installed
+uv cache clean
+
 # Install the nf-binder-vis package and its dependencies
 uv pip install -e .
 
 # Install the local streamlit-file-browser
-cd streamlit-file-browser
-uv pip install -e .
+cd streamlit-file-browser/streamlit_file_browser/frontend/
+# Use --legacy-peer-deps to handle TypeScript version conflict (if still needed)
+npm install --legacy-peer-deps
+# If using Node.js >= 17, you might need to set OpenSSL legacy provider
+export NODE_OPTIONS=--openssl-legacy-provider
+npm run build
+cd ../../ # Back to streamlit-file-browser root
+
+# Ensure setuptools is available for setup.py
+uv pip install setuptools wheel
+# Build the sdist package using setup.py
+python setup.py sdist
+# Install the built package from its dist directory
+uv pip install --force-reinstall dist/streamlit_file_browser-*.tar.gz
 cd ..
 ```
 
