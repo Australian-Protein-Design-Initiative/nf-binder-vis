@@ -96,6 +96,15 @@ streamlit run app.py -- --path /path/to/results
 uv run streamlit run app.py -- --path /path/to/results
 ```
 
+Or the BindCraft version:
+```bash
+uv run streamlit run bindcraft.py -- --path /path/to/bindcraft/runs
+# This will detect mutliple bindcraft runs recursively under this path and aggregate the results for Accepted models
+#
+# The thumbs up/thumbs down populates a 'good' column in /path/to/bindcraft/runs/bindcraft_summary.tsv
+# that can be used to select on-target and off-target binders manually
+```
+
 This will use the local version of streamlit-file-browser with its Node.js dependencies properly installed.
 
 Open http://localhost:8501/
