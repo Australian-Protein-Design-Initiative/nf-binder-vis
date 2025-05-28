@@ -21,6 +21,7 @@ import streamlit as st
 import seaborn as sns
 import matplotlib.pyplot as plt
 import altair as alt
+import numpy as np # Import numpy
 from typing import Optional, List, Any, Tuple
 from streamlit_molstar import st_molstar, st_molstar_rcsb, st_molstar_remote
 from streamlit_molstar.auto import st_molstar_auto
@@ -170,6 +171,15 @@ def load_bindcraft_data(root_search_path: Path) -> Optional[pd.DataFrame]:
         
     combined_df = combined_df.convert_dtypes(convert_string=False) # Avoid converting our StringDtype pdb_file back
 
+    # Add 'good' column, default to False
+    if 'good' not in combined_df.columns:
+        # Insert 'good' as the second column (index 1) if possible, or first if df is narrow.
+        # The actual display order in the table is controlled later.
+        insert_pos = 1 if len(combined_df.columns) > 0 else 0
+        combined_df.insert(insert_pos, 'good', False) # Pandas will broadcast False to all rows
+    else: # Ensure it's boolean
+        combined_df['good'] = combined_df['good'].astype(bool)
+
     # Always attempt to sort by DEFAULT_SORT_COLUMN (Average_i_pTM) if it exists
     if DEFAULT_SORT_COLUMN in combined_df.columns:
         combined_df = combined_df.sort_values(DEFAULT_SORT_COLUMN, ascending=DEFAULT_SORT_ASCENDING).reset_index(drop=True)
@@ -237,6 +247,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # Define the summary file path
+    summary_file_path = Path(args.path).resolve() / "bindcraft_summary.tsv"
+
     # Initialize session state for path if not exists
     if "root_search_path" not in st.session_state: # Renamed for clarity
         st.session_state["root_search_path"] = Path(args.path).resolve()
@@ -245,29 +258,147 @@ def main():
     if "selected_df_indices" not in st.session_state: # Changed from selected_df_index
         st.session_state.selected_df_indices = [] # Initialize as an empty list
 
-    # Sidebar for path input - REMOVED st_file_browser
+    # Initialize df in session state if it's not already there to prevent AttributeError
+    if "df" not in st.session_state:
+        st.session_state.df = None
+
+    # Sidebar for path input and regenerate button
     with st.sidebar:
         st.header("Results Directory")
-        # Display the current search path, not editable via UI for now
         st.info(f"Searching in: {st.session_state.root_search_path}")
         st.markdown("To change the search directory, please restart the app with the desired `--path` argument.")
+        st.divider()
 
-    # Use the current path from session state
-    df = load_bindcraft_data(st.session_state.root_search_path) # New function
+        if st.button("🔄 Regenerate Summary File", 
+                      help="Re-scans the directory, merges existing 'good' ratings, and overwrites bindcraft_summary.tsv"):
+            with st.spinner("Regenerating summary file..."):
+                # Force a re-scan and merge by temporarily setting df to None in session_state
+                # The logic below will then handle the full scan, merge, and save.
+                # This ensures that even if a summary file exists, we are truly regenerating it.
+                current_summary_df = None
+                if summary_file_path.exists():
+                    try:
+                        current_summary_df = pd.read_csv(summary_file_path, sep="\t")
+                    except Exception as e:
+                        st.warning(f"Could not read existing summary file for regeneration: {e}")
+
+                fresh_df = load_bindcraft_data(st.session_state.root_search_path)
+                if fresh_df is not None:
+                    if 'good' not in fresh_df.columns:
+                        insert_pos = 1 if len(fresh_df.columns) > 0 else 0
+                        fresh_df.insert(insert_pos, 'good', False)
+                    else:
+                        fresh_df['good'] = fresh_df['good'].fillna(False).astype(bool)
+
+                    if current_summary_df is not None and \
+                       "Design" in current_summary_df.columns and \
+                       "results_dir_path" in current_summary_df.columns and \
+                       "good" in current_summary_df.columns:
+                        
+                        good_stamps_to_merge = current_summary_df[
+                            ["Design", "results_dir_path", "good"]
+                        ].drop_duplicates(subset=["Design", "results_dir_path"], keep='first')
+                        
+                        if 'good' in fresh_df.columns: # Should exist due to above ensure block
+                            fresh_df = fresh_df.drop(columns=['good'])
+                        
+                        fresh_df = pd.merge(
+                            fresh_df, 
+                            good_stamps_to_merge, 
+                            on=["Design", "results_dir_path"], 
+                            how='left'
+                        )
+                        fresh_df['good'] = fresh_df['good'].fillna(False).astype(bool)
+                    
+                    st.session_state.df = fresh_df
+                    try:
+                        st.session_state.df.to_csv(summary_file_path, sep="\t", index=False)
+                        st.success("Summary file regenerated and saved.")
+                    except Exception as e:
+                        st.error(f"Error saving regenerated summary file: {e}")
+                    
+                    st.session_state.selected_df_indices = []
+                    if "good" in st.session_state.df.columns:
+                        st.session_state.good_values = pd.Series(st.session_state.df["good"], index=st.session_state.df.index, dtype=bool)
+                    else:
+                        st.session_state.good_values = pd.Series([False] * len(st.session_state.df), index=st.session_state.df.index, dtype=bool)
+                    st.rerun()
+                else:
+                    st.error("Failed to load data during regeneration scan.")
+
+    # Attempt to load data: either from existing session_state.df (if already loaded/regenerated),
+    # or from summary file, or by scanning if summary doesn't exist.
+    if st.session_state.df is None: # Only proceed if df is not already set (e.g., by regeneration button)
+        if summary_file_path.exists():
+            try:
+                st.session_state.df = pd.read_csv(summary_file_path, sep="\t")
+                if "good" in st.session_state.df.columns:
+                    st.session_state.df["good"] = st.session_state.df["good"].fillna(False).astype(bool)
+                else:
+                    st.session_state.df["good"] = False # Add good column if missing, pandas will broadcast
+                
+                if 'pdb_file' in st.session_state.df.columns:
+                    st.session_state.df['pdb_file'] = st.session_state.df['pdb_file'].astype(pd.StringDtype())
+                if 'results_dir_path' in st.session_state.df.columns:
+                    st.session_state.df['results_dir_path'] = st.session_state.df['results_dir_path'].astype(pd.StringDtype())
+                
+                st.session_state.df = st.session_state.df.convert_dtypes(convert_string=False)
+                if DEFAULT_SORT_COLUMN in st.session_state.df.columns:
+                    st.session_state.df = st.session_state.df.sort_values(DEFAULT_SORT_COLUMN, ascending=DEFAULT_SORT_ASCENDING).reset_index(drop=True)
+                else:
+                    st.session_state.df = st.session_state.df.reset_index(drop=True)
+                st.info(f"Loaded data from summary file: {summary_file_path}")
+            except Exception as e:
+                st.error(f"Error loading summary file {summary_file_path}: {e}. Will perform initial scan.")
+                st.session_state.df = None # Explicitly set to None to trigger scan below
+
+        # If df is still None (summary didn't exist or failed to load), then perform initial scan and create summary.
+        if st.session_state.df is None:
+            st.session_state.df = load_bindcraft_data(st.session_state.root_search_path)
+            if st.session_state.df is not None:
+                # Ensure 'good' column exists before first save
+                if 'good' not in st.session_state.df.columns:
+                    insert_pos = 1 if len(st.session_state.df.columns) > 0 else 0
+                    st.session_state.df.insert(insert_pos, 'good', False)
+                else:
+                    st.session_state.df['good'] = st.session_state.df['good'].fillna(False).astype(bool)
+                try:
+                    st.session_state.df.to_csv(summary_file_path, sep="\t", index=False)
+                    st.success(f"Initial summary file created: {summary_file_path}")
+                except Exception as e:
+                    st.error(f"Could not create initial summary file {summary_file_path}: {e}")
+            # If df is STILL None after scan, then there's nothing to load or create.
+
+    df = st.session_state.df
+
     if df is None:
-        st.warning("No BindCraft data loaded. Please ensure the specified path contains valid BindCraft results.")
+        st.warning("No BindCraft data loaded. Please ensure the specified path contains valid BindCraft results or a summary file.")
         return
 
+    # Initialize or sync 'good_values' session state with the current df's 'good' column
+    # This should happen regardless of how df was loaded (summary or scan)
+    if "good" in df.columns:
+        st.session_state.good_values = pd.Series(df["good"], index=df.index, dtype=bool)
+    else: # Should not happen if load_bindcraft_data or summary loading works
+        st.session_state.good_values = pd.Series([False] * len(df), index=df.index, dtype=bool)
+        df["good"] = st.session_state.good_values # Add good column to df if it's missing
+
+    # Ensure df also reflects the most current 'good' values from session_state
+    # (This might be redundant if just initialized, but good for consistency)
+    df["good"] = st.session_state.good_values.reindex(df.index, fill_value=False).astype(bool)
+    
     # Get numeric columns for plotting
-    numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
+    # Use np.number to select all numeric types, which is more robust for linters.
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
 
     # Initialize session state for column selection if not exists
     if "selected_cols" not in st.session_state:
         # Prioritize these columns, then add the rest
         # Updated to use more likely column names based on user-provided CSV header
         default_table_display_order = [
-            DEFAULT_SORT_COLUMN, 
-            DEFAULT_SCATTER_X_COL, 
+            "good", # Make this the first *data* column displayed by default
+            DEFAULT_SORT_COLUMN,
+            DEFAULT_SCATTER_X_COL,
             "Average_Binder_RMSD", # More specific RMSD column
             "Design", 
             "pdb_file", 
@@ -304,6 +435,10 @@ def main():
     if "scatter_y_col" not in st.session_state:
         st.session_state.scatter_y_col = default_y_col
     
+    # Initialize session state for auto_next checkbox
+    if "auto_next_on_thumbs_click" not in st.session_state:
+        st.session_state.auto_next_on_thumbs_click = False
+
     # Prepare DataFrame for the data_editor: add a selection column
     # This df_for_editor will be updated based on st.session_state.selected_df_indices
     df_for_editor = df.copy()
@@ -313,8 +448,10 @@ def main():
         for idx in st.session_state.selected_df_indices:
             if 0 <= idx < len(df_for_editor):
                 df_for_editor.loc[idx, selection_col_name] = True
-            # else: Malformed index in list, could add a warning or clean-up step
-
+    
+    # Update 'good' column in df_for_editor from the main df (which is synced with session_state)
+    if 'good' in df.columns and 'good' in df_for_editor.columns:
+        df_for_editor['good'] = df['good']
 
     # Create tabs for different views
     table_tab, scatter_tab, dist_tab = st.tabs(
@@ -334,18 +471,24 @@ def main():
                 help="Select a row to view structure",
                 default=False,
             ),
+            "good": st.column_config.CheckboxColumn( # Added configuration for 'good' column
+                "Good",
+                help="Mark as a good design",
+                default=False,
+            ),
             **{
                 col: st.column_config.NumberColumn(col, format="%.3f")
                 for col in numeric_cols if col in df_for_editor.columns
             },
         }
 
-        # Ensure that the list of columns passed to data_editor only contains what's intended.
         # Put selection column first.
-        columns_to_display_in_editor = [selection_col_name] + [col for col in st.session_state.selected_cols if col != selection_col_name]
-        
+        columns_to_display_in_editor = [selection_col_name] + [col for col in st.session_state.selected_cols if col in df_for_editor.columns and col != selection_col_name]
+
+        # The complex logic to insert 'good' here is removed, as its order is now controlled by st.session_state.selected_cols,
+        # which is initialized by default_table_display_order.
+
         # Filter df_for_editor to only include columns that will be displayed
-        # This ensures that column_config only needs to be concerned with these displayed columns.
         df_display_subset = df_for_editor[columns_to_display_in_editor]
 
         edited_df_from_editor = st.data_editor(
@@ -353,7 +496,7 @@ def main():
             hide_index=True,
             use_container_width=True,
             column_config=editor_column_config, # Config should now align with df_display_subset
-            disabled=[col for col in df.columns if col != selection_col_name], # Still disable original data columns from df
+            disabled=[col for col in df.columns if col not in [selection_col_name, "good"]], # Allow 'good' to be edited
             key="data_editor_table",
         )
 
@@ -446,8 +589,32 @@ def main():
         # the indices in edited_df_from_editor (if it has an index) should align with df_for_editor.
         # Let's assume edited_df_from_editor refers to the state of the columns we passed to it.
         
+        # Process 'good' column changes from the editor
+        if "good" in edited_df_from_editor.columns and "good" in df.columns:
+            # Iterate through the edited_df_from_editor to find changes in the 'good' column
+            # The index of edited_df_from_editor should align with df if no sorting/filtering was applied
+            # by the data_editor itself on the passed data, which is the case here.
+            changed_good_series = edited_df_from_editor["good"]
+            for original_df_idx in changed_good_series.index: # original_df_idx here is the index from the DataFrame
+                if original_df_idx in df.index: # Ensure index is valid for original df
+                    new_good_value = changed_good_series.loc[original_df_idx]
+                    # Ensure new_good_value is a boolean
+                    new_good_value_bool = bool(new_good_value)
+
+                    # Check against the session state directly or the df synced with session state
+                    current_good_value_in_state = bool(st.session_state.good_values.loc[original_df_idx])
+                    
+                    if current_good_value_in_state != new_good_value_bool:
+                        df.loc[original_df_idx, "good"] = new_good_value_bool
+                        st.session_state.good_values.loc[original_df_idx] = new_good_value_bool
+                        new_selection_made_in_this_run = True # Mark that a change was made
+                        # Save DataFrame to TSV after editor change
+                        try:
+                            df.to_csv(summary_file_path, sep="\t", index=False)
+                        except Exception as e:
+                            st.error(f"Error saving summary file: {e}")
+
         # Check if the selection column exists in the output of data_editor
-        # It should, as we added it to df_for_editor and configured it.
         if selection_col_name in edited_df_from_editor.columns:
             selected_in_editor_series = edited_df_from_editor[selection_col_name]
             
@@ -466,7 +633,6 @@ def main():
                 # This means the user manually unchecked all active rows.
                 st.session_state.selected_df_indices = []
                 new_selection_made_in_this_run = True
-
 
     # 2. Process selection from scatter plot
     if scatter_event_result: 
@@ -508,78 +674,101 @@ def main():
     st.header("Structure Viewer")
 
     # Define col_info here to ensure it's in scope if df is not empty
-    col_prev, col_info, col_next = (None, None, None) 
+    # col_prev, col_info, col_next = (None, None, None) # Old column definition
+    
+    # New layout for structure controls
     if not df.empty:
-        col_prev, col_info, col_next = st.columns([2, 8, 2])
+        # Columns for: Prev, Thumbs Up, Thumbs Down, Info, Next
+        col_prev_btn, col_thumb_up, col_thumb_down, col_info_display, col_next_btn = st.columns([1.5, 1, 1, 6, 1.5])
 
-        # Determine primary index for Next/Previous logic (e.g., first selected or last if any)
         primary_idx_for_nav = st.session_state.selected_df_indices[0] if st.session_state.selected_df_indices else None
 
-        with col_prev:
+        with col_prev_btn:
             prev_disabled = primary_idx_for_nav is None or primary_idx_for_nav == 0
-            if st.button("⬅️ Previous", disabled=prev_disabled, use_container_width=True):
+            if st.button("⬅️", help="Previous Structure", disabled=prev_disabled, use_container_width=True):
                 if primary_idx_for_nav is not None and primary_idx_for_nav > 0:
                     st.session_state.selected_df_indices = [primary_idx_for_nav - 1]
-                    st.rerun() 
+                    st.rerun()
+        
+        with col_thumb_up:
+            thumb_up_disabled = not (primary_idx_for_nav is not None and len(st.session_state.selected_df_indices) == 1)
+            if st.button("👍", help="Mark as Good", disabled=thumb_up_disabled, use_container_width=True):
+                if "good" in df.columns and primary_idx_for_nav is not None and primary_idx_for_nav in df.index:
+                    idx_to_update = int(primary_idx_for_nav)
+                    df.loc[idx_to_update, "good"] = True
+                    if idx_to_update in st.session_state.good_values.index:
+                        st.session_state.good_values.loc[idx_to_update] = True
+                    try:
+                        df.to_csv(summary_file_path, sep="\t", index=False)
+                    except Exception as e:
+                        st.error(f"Error saving summary file: {e}")
+                    if st.session_state.auto_next_on_thumbs_click and idx_to_update < len(df) - 1:
+                        st.session_state.selected_df_indices = [idx_to_update + 1]
+                    st.rerun()
 
-        with col_next:
+        with col_thumb_down:
+            thumb_down_disabled = not (primary_idx_for_nav is not None and len(st.session_state.selected_df_indices) == 1)
+            if st.button("👎", help="Mark as Not Good", disabled=thumb_down_disabled, use_container_width=True):
+                if "good" in df.columns and primary_idx_for_nav is not None and primary_idx_for_nav in df.index:
+                    idx_to_update = int(primary_idx_for_nav)
+                    df.loc[idx_to_update, "good"] = False
+                    if idx_to_update in st.session_state.good_values.index:
+                        st.session_state.good_values.loc[idx_to_update] = False
+                    try:
+                        df.to_csv(summary_file_path, sep="\t", index=False)
+                    except Exception as e:
+                        st.error(f"Error saving summary file: {e}")
+                    if st.session_state.auto_next_on_thumbs_click and idx_to_update < len(df) - 1:
+                        st.session_state.selected_df_indices = [idx_to_update + 1]
+                    st.rerun()
+        
+        with col_info_display:
+            if primary_idx_for_nav is not None and len(st.session_state.selected_df_indices) == 1:
+                selected_row_for_info = df.iloc[primary_idx_for_nav]
+                design_name = selected_row_for_info.get("Design", "") 
+                metric_value_for_display = selected_row_for_info.get(DEFAULT_SORT_COLUMN, 'N/A') 
+                metric_text = "N/A"
+                try:
+                    metric_float = float(metric_value_for_display)
+                    metric_text = f"{metric_float:.3f}"
+                except (ValueError, TypeError):
+                    metric_text = str(metric_value_for_display) if pd.notna(metric_value_for_display) else "N/A"
+                results_dir_path_text = selected_row_for_info.get("results_dir_path", "N/A")
+                good_status = selected_row_for_info.get("good", False)
+                good_status_emoji = "✅" if good_status else "❌"
+                
+                table_data = {
+                    "Attribute": [f"Model (rank {primary_idx_for_nav + 1}/{len(df)}):", "Run:", f"{DEFAULT_SORT_COLUMN}", f"Good ({len(df[df['good'] == True])}/{len(df)}):"],
+                    "Value": [design_name, results_dir_path_text, metric_text, good_status_emoji]
+                }
+                df_info_table = pd.DataFrame(table_data)
+                st.markdown(df_info_table.to_html(index=False, header=False, border=0, classes=["no-header-table"]), unsafe_allow_html=True)
+            elif len(st.session_state.selected_df_indices) > 1:
+                st.markdown(f"_{len(st.session_state.selected_df_indices)} structures selected_" )
+            else:
+                st.markdown("_No structure selected_")
+
+        with col_next_btn:
             next_disabled = primary_idx_for_nav is None or primary_idx_for_nav >= len(df) - 1
-            if st.button("Next ➡️", disabled=next_disabled, use_container_width=True):
+            if st.button("➡️", help="Next Structure", disabled=next_disabled, use_container_width=True):
                 if primary_idx_for_nav is not None and primary_idx_for_nav < len(df) - 1:
                     st.session_state.selected_df_indices = [primary_idx_for_nav + 1]
-                    st.rerun() 
+                    st.rerun()
     else:
         st.info("No data loaded to display structures.")
 
+    # "Auto next" checkbox below the structure viewer, if structures are being viewed
+    # This logic for checkbox placement is now dependent on pdb_paths_to_view having content.
 
     if st.session_state.selected_df_indices and not df.empty:
         pdb_paths_to_view = []
-        first_selected_idx = st.session_state.selected_df_indices[0]
-
-        # Display info for the first selected structure
-        if isinstance(first_selected_idx, int) and 0 <= first_selected_idx < len(df):
-            selected_row_for_info = df.iloc[first_selected_idx]
-            design_name = selected_row_for_info.get("Design", "") 
-            metric_value_for_display = selected_row_for_info.get(DEFAULT_SORT_COLUMN, 'N/A') 
-            metric_text = "N/A"
-            try:
-                metric_float = float(metric_value_for_display)
-                metric_text = f"{metric_float:.3f}"
-            except (ValueError, TypeError):
-                metric_text = str(metric_value_for_display) if pd.notna(metric_value_for_display) else "N/A"
-
-            results_dir_path_text = selected_row_for_info.get("results_dir_path", "N/A")
-
-            if col_info is not None: 
-                with col_info:
-                    # Create a markdown table
-                    table_data = {
-                        "Attribute": ["Model:", "Run:", f"{DEFAULT_SORT_COLUMN} (first):"],
-                        "Value": [design_name, results_dir_path_text, metric_text]
-                    }
-                    if len(st.session_state.selected_df_indices) > 1:
-                        table_data["Value"][0] += f" (+{len(st.session_state.selected_df_indices) - 1} more)"
-
-                    df_table = pd.DataFrame(table_data)
-                    # Generate HTML table without a header
-                    html_table = df_table.to_html(index=False, header=False, border=0, classes=["no-header-table"])
-
-                    st.markdown(html_table, unsafe_allow_html=True)
-            else: 
-                # Fallback if col_info is not defined (should not happen with current layout)
-                st.markdown(f"**Model (first):** {design_name}")
-                if len(st.session_state.selected_df_indices) > 1:
-                    st.caption(f"(Total {len(st.session_state.selected_df_indices)} structures selected)")
-                st.markdown(f"**Run:** {results_dir_path_text}")
-                st.markdown(f"**{DEFAULT_SORT_COLUMN} (first):** {metric_text}")
-
-        # Collect PDB paths for all selected structures
+        # The info display logic previously here is now moved into col_info_display above.
+        # We still need to collect PDB paths for the viewer itself.
         for idx in st.session_state.selected_df_indices:
             if isinstance(idx, int) and 0 <= idx < len(df):
                 row = df.iloc[idx]
-                # Use 'pdb_file' column which should hold the full path
                 pdb_file_path_str = row.get("pdb_file")
-                design_name_for_warning = row.get("Design", f"Row index {idx}") # For better error messages
+                design_name_for_warning = row.get("Design", f"Row index {idx}")
                 if pdb_file_path_str:
                     pdb_path = Path(pdb_file_path_str)
                     if pdb_path.exists():
@@ -592,10 +781,13 @@ def main():
                 st.warning(f"Invalid index {idx} in selection list.")
         
         if pdb_paths_to_view:
-            # Create a dynamic key based on the PDB paths to ensure st_molstar_auto updates
             molstar_key = "mol_viewer_" + "_".join(sorted([Path(p).stem for p in pdb_paths_to_view]))
             st_molstar_auto(pdb_paths_to_view, key=molstar_key, height="600px")
-        elif st.session_state.selected_df_indices: # Selected items exist, but no PDBs found for them
+            
+            st.checkbox("Auto next on 👍/👎 click", key="auto_next_on_thumbs_click", value=True,
+                        help="If checked, clicking thumbs up or down will automatically advance to the next structure.")
+
+        elif st.session_state.selected_df_indices: 
             st.info("Selected item(s) have no valid PDB files to display a structure.")
 
     elif not df.empty:
