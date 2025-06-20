@@ -36,6 +36,33 @@ DEFAULT_SCATTER_X_COL = "Average_pLDDT" # Typical pLDDT column
 DEFAULT_DIST_METRIC = DEFAULT_SORT_COLUMN
 # ----------------------------------
 
+def update_good_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates and updates the 'good_rank' column based on the existing sort order.
+    The input DataFrame is expected to be sorted already.
+    """
+    # Ensure the 'good' column exists
+    if 'good' not in df.columns:
+        df['good_rank'] = pd.NA
+        return df.astype({'good_rank': 'Int64'})
+
+    # Get the indices of rows marked as 'good'
+    good_indices = df[df['good']].index
+
+    # Create a Series with ranks for the 'good' rows
+    # The rank is based on the existing order in the DataFrame
+    good_rank_series = pd.Series(np.arange(1, len(good_indices) + 1), index=good_indices)
+
+    # Assign this series to the new 'good_rank' column.
+    # Rows not in good_indices will get NaN.
+    df['good_rank'] = good_rank_series
+
+    # Convert to nullable integer type to support NAs
+    df['good_rank'] = df['good_rank'].astype('Int64')
+
+    return df
+
+
 def is_bindcraft_results(path: Path) -> bool:
     """Check if a directory contains BindCraft results (final_design_stats.csv and Accepted/ folder)."""
     if not path.is_dir():
@@ -187,6 +214,18 @@ def load_bindcraft_data(root_search_path: Path) -> Optional[pd.DataFrame]:
         st.warning(f"'{DEFAULT_SORT_COLUMN}' column not found in the aggregated data. Cannot sort by it.")
         combined_df = combined_df.reset_index(drop=True)
 
+    # Add Rank column from 1 to N and position it after 'good'.
+    combined_df['Rank'] = np.arange(1, len(combined_df) + 1).astype(int)
+    cols = combined_df.columns.tolist()
+    if 'good' in cols:
+        cols.remove('Rank')
+        good_index = cols.index('good')
+        cols.insert(good_index + 1, 'Rank')
+        combined_df = combined_df[cols]
+
+    # Add/update good_rank
+    combined_df = update_good_rank(combined_df)
+
     return combined_df
 
 
@@ -310,9 +349,12 @@ def main():
                         )
                         fresh_df['good'] = fresh_df['good'].fillna(False).astype(bool)
                     
+                    # With 'good' status merged, we need to recalculate good_rank
+                    fresh_df = update_good_rank(fresh_df)
+
                     st.session_state.df = fresh_df
                     try:
-                        st.session_state.df.to_csv(summary_file_path, sep="\t", index=False)
+                        st.session_state.df.drop(columns=['good_rank'], errors='ignore').to_csv(summary_file_path, sep="\t", index=False)
                         st.success("Summary file regenerated and saved.")
                     except Exception as e:
                         st.error(f"Error saving regenerated summary file: {e}")
@@ -332,6 +374,10 @@ def main():
         if summary_file_path.exists():
             try:
                 st.session_state.df = pd.read_csv(summary_file_path, sep="\t")
+                # Always remove Rank if it exists, to re-calculate it based on current sort.
+                if 'Rank' in st.session_state.df.columns:
+                    st.session_state.df = st.session_state.df.drop(columns=['Rank'])
+
                 if "good" in st.session_state.df.columns:
                     st.session_state.df["good"] = st.session_state.df["good"].fillna(False).astype(bool)
                 else:
@@ -347,6 +393,19 @@ def main():
                     st.session_state.df = st.session_state.df.sort_values(DEFAULT_SORT_COLUMN, ascending=DEFAULT_SORT_ASCENDING).reset_index(drop=True)
                 else:
                     st.session_state.df = st.session_state.df.reset_index(drop=True)
+
+                # Add Rank column from 1 to N and position it after 'good'.
+                st.session_state.df['Rank'] = np.arange(1, len(st.session_state.df) + 1).astype(int)
+                cols = st.session_state.df.columns.tolist()
+                if 'good' in cols:
+                    cols.remove('Rank')
+                    good_index = cols.index('good')
+                    cols.insert(good_index + 1, 'Rank')
+                    st.session_state.df = st.session_state.df[cols]
+
+                # Update good_rank after loading and sorting
+                st.session_state.df = update_good_rank(st.session_state.df)
+
                 st.info(f"Loaded data from summary file: {summary_file_path}")
             except Exception as e:
                 st.error(f"Error loading summary file {summary_file_path}: {e}. Will perform initial scan.")
@@ -363,7 +422,7 @@ def main():
                 else:
                     st.session_state.df['good'] = st.session_state.df['good'].fillna(False).astype(bool)
                 try:
-                    st.session_state.df.to_csv(summary_file_path, sep="\t", index=False)
+                    st.session_state.df.drop(columns=['good_rank'], errors='ignore').to_csv(summary_file_path, sep="\t", index=False)
                     st.success(f"Initial summary file created: {summary_file_path}")
                 except Exception as e:
                     st.error(f"Could not create initial summary file {summary_file_path}: {e}")
@@ -397,6 +456,8 @@ def main():
         # Updated to use more likely column names based on user-provided CSV header
         default_table_display_order = [
             "good", # Make this the first *data* column displayed by default
+            "Rank",
+            "good_rank",
             DEFAULT_SORT_COLUMN,
             DEFAULT_SCATTER_X_COL,
             "Average_Binder_RMSD", # More specific RMSD column
@@ -439,6 +500,10 @@ def main():
     if "auto_next_on_thumbs_click" not in st.session_state:
         st.session_state.auto_next_on_thumbs_click = False
 
+    # Initialize session state for "Show good only" filter
+    if 'show_good_only' not in st.session_state:
+        st.session_state.show_good_only = False
+
     # Prepare DataFrame for the data_editor: add a selection column
     # This df_for_editor will be updated based on st.session_state.selected_df_indices
     df_for_editor = df.copy()
@@ -453,6 +518,12 @@ def main():
     if 'good' in df.columns and 'good' in df_for_editor.columns:
         df_for_editor['good'] = df['good']
 
+    # Create a view of the dataframe that can be filtered for display
+    df_display = df_for_editor
+    if st.session_state.show_good_only:
+        if 'good' in df_display.columns:
+            df_display = df_display[df_display['good'] == True]
+
     # Create tabs for different views
     table_tab, scatter_tab, dist_tab = st.tabs(
         ["Data Table", "Scatter Plot", "Distributions"]
@@ -463,7 +534,10 @@ def main():
     edited_df_from_editor = None # To store the result from st.data_editor
 
     with table_tab:
-        st.info(f"Total rows: {len(df_for_editor)}")
+        if st.session_state.show_good_only:
+            st.info(f"Displaying {len(df_display)} of {len(df)} total rows (good only).")
+        else:
+            st.info(f"Total rows: {len(df_for_editor)}")
         
         editor_column_config = {
             selection_col_name: st.column_config.CheckboxColumn(
@@ -482,14 +556,23 @@ def main():
             },
         }
 
+        # Override Rank column to ensure integer display
+        if 'Rank' in df_for_editor.columns:
+            editor_column_config['Rank'] = st.column_config.NumberColumn("Rank", format="%d")
+
+        # Override good_rank column to ensure integer display and add help text
+        if 'good_rank' in df_for_editor.columns:
+            editor_column_config['good_rank'] = st.column_config.NumberColumn(
+                "Good Rank",
+                format="%d",
+                help="Rank among only 'Good' designs"
+            )
+
         # Put selection column first.
         columns_to_display_in_editor = [selection_col_name] + [col for col in st.session_state.selected_cols if col in df_for_editor.columns and col != selection_col_name]
 
-        # The complex logic to insert 'good' here is removed, as its order is now controlled by st.session_state.selected_cols,
-        # which is initialized by default_table_display_order.
-
         # Filter df_for_editor to only include columns that will be displayed
-        df_display_subset = df_for_editor[columns_to_display_in_editor]
+        df_display_subset = df_display[columns_to_display_in_editor]
 
         edited_df_from_editor = st.data_editor(
             df_display_subset, # Pass the subset
@@ -504,6 +587,11 @@ def main():
         st.caption("Table Controls")
         # Put column selector in expander
         with st.expander("Column Display Settings"):
+            st.checkbox(
+                "Show good only", 
+                key="show_good_only",
+                help="Filter the table to show only designs marked as 'Good'."
+            )
             all_cols = df.columns.tolist()
             # Show ipTM first in options
             if "Average_i_pTM" in all_cols:
@@ -608,9 +696,14 @@ def main():
                         df.loc[original_df_idx, "good"] = new_good_value_bool
                         st.session_state.good_values.loc[original_df_idx] = new_good_value_bool
                         new_selection_made_in_this_run = True # Mark that a change was made
+
+                        # A 'good' value changed, so we need to re-calculate the good_rank
+                        df = update_good_rank(df)
+                        st.session_state.df = df # also update session state
+
                         # Save DataFrame to TSV after editor change
                         try:
-                            df.to_csv(summary_file_path, sep="\t", index=False)
+                            df.drop(columns=['good_rank'], errors='ignore').to_csv(summary_file_path, sep="\t", index=False)
                         except Exception as e:
                             st.error(f"Error saving summary file: {e}")
 
@@ -697,9 +790,14 @@ def main():
                     idx_to_update = int(primary_idx_for_nav)
                     df.loc[idx_to_update, "good"] = True
                     if idx_to_update in st.session_state.good_values.index:
-                        st.session_state.good_values.loc[idx_to_update] = True
+                        st.session_state.good_values.at[idx_to_update] = True
+                    
+                    # A 'good' value changed, so we need to re-calculate the good_rank
+                    df = update_good_rank(df)
+                    st.session_state.df = df # also update session state
+
                     try:
-                        df.to_csv(summary_file_path, sep="\t", index=False)
+                        df.drop(columns=['good_rank'], errors='ignore').to_csv(summary_file_path, sep="\t", index=False)
                     except Exception as e:
                         st.error(f"Error saving summary file: {e}")
                     if st.session_state.auto_next_on_thumbs_click and idx_to_update < len(df) - 1:
@@ -713,9 +811,14 @@ def main():
                     idx_to_update = int(primary_idx_for_nav)
                     df.loc[idx_to_update, "good"] = False
                     if idx_to_update in st.session_state.good_values.index:
-                        st.session_state.good_values.loc[idx_to_update] = False
+                        st.session_state.good_values.at[idx_to_update] = False
+
+                    # A 'good' value changed, so we need to re-calculate the good_rank
+                    df = update_good_rank(df)
+                    st.session_state.df = df # also update session state
+
                     try:
-                        df.to_csv(summary_file_path, sep="\t", index=False)
+                        df.drop(columns=['good_rank'], errors='ignore').to_csv(summary_file_path, sep="\t", index=False)
                     except Exception as e:
                         st.error(f"Error saving summary file: {e}")
                     if st.session_state.auto_next_on_thumbs_click and idx_to_update < len(df) - 1:
@@ -726,6 +829,7 @@ def main():
             if primary_idx_for_nav is not None and len(st.session_state.selected_df_indices) == 1:
                 selected_row_for_info = df.iloc[primary_idx_for_nav]
                 design_name = selected_row_for_info.get("Design", "") 
+                rank_value = selected_row_for_info.get("Rank", primary_idx_for_nav + 1)
                 metric_value_for_display = selected_row_for_info.get(DEFAULT_SORT_COLUMN, 'N/A') 
                 metric_text = "N/A"
                 try:
@@ -738,8 +842,8 @@ def main():
                 good_status_emoji = "✅" if good_status else "❌"
                 
                 table_data = {
-                    "Attribute": [f"Model (rank {primary_idx_for_nav + 1}/{len(df)}):", "Run:", f"{DEFAULT_SORT_COLUMN}", f"Good ({len(df[df['good'] == True])}/{len(df)}):"],
-                    "Value": [design_name, results_dir_path_text, metric_text, good_status_emoji]
+                    "Attribute": ["Rank:", "Model:", "Run:", f"{DEFAULT_SORT_COLUMN}", f"Good ({len(df[df['good'] == True])}/{len(df)}):"],
+                    "Value": [f"{rank_value}/{len(df)}", design_name, results_dir_path_text, metric_text, good_status_emoji]
                 }
                 df_info_table = pd.DataFrame(table_data)
                 st.markdown(df_info_table.to_html(index=False, header=False, border=0, classes=["no-header-table"]), unsafe_allow_html=True)
