@@ -68,9 +68,8 @@ docker run -it --rm -v /abs/path/to/results:/results nf-binder-vis:latest -- --p
 Open http://localhost:8501/
 
 
-
 ## TODO
 
 - Look at https://github.com/PDBeurope/pdb-images#pdbimages - can we pre-render a galley of images for each pdb file?
-- BindCraft support
+- Merge `app.y` and `bindcraft.py` to support generic binder pipelines (scores table + PDBs) ?
 
