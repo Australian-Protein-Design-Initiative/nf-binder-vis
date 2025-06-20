@@ -2,6 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install system dependencies including Node.js and npm
 RUN apt-get update && apt-get install -y \
     build-essential \
