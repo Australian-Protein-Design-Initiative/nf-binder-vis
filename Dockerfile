@@ -27,6 +27,7 @@ RUN git clone https://github.com/pansapiens/streamlit-file-browser.git /app/stre
 # Install npm dependencies for streamlit-file-browser and build
 RUN cd /app/streamlit-file-browser/streamlit_file_browser/frontend && \
     npm install --legacy-peer-deps && \
+    npm install @types/minimatch@^3.0.5 --legacy-peer-deps && \
     export NODE_OPTIONS=--openssl-legacy-provider && \
     npm run build && \
     cd ../.. && \
@@ -35,7 +36,7 @@ RUN cd /app/streamlit-file-browser/streamlit_file_browser/frontend && \
 
 # Install streamlit-file-browser directly from local copy
 RUN pip install --no-cache-dir --force-reinstall \
-    ./streamlit-file-browser/dist/streamlit-file-browser-*.tar.gz
+    ./streamlit-file-browser/dist/streamlit_file_browser-*.tar.gz
 
 # Copy app code
 COPY . /app/
