@@ -791,9 +791,29 @@ def plot_scatter(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[Any]:
 
 def main():
     # Set up page config for wide mode and collapsed sidebar
-    st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(
+        page_title="nf-binder-vis", layout="wide", initial_sidebar_state="collapsed"
+    )
 
-    st.title("Protein Binder Design Results Viewer")
+    # Hide Streamlit menu, footer and deploy button
+    st.markdown(
+        """
+        <style>
+            .reportview-container {
+                margin-top: -2em;
+            }
+            #MainMenu {visibility: hidden;}
+            .stDeployButton {display:none;}
+            .stAppDeployButton {display:none;}
+            footer {visibility: hidden;}
+            #stDecoration {display:none;}
+        </style>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("nf-binder-vis")
+    st.subheader("Protein Binder Design Results Viewer")
 
     # Command line argument for default path
     parser = argparse.ArgumentParser()

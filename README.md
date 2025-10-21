@@ -1,6 +1,8 @@
 # nf-binder-vis
 
-Results visualization for the nf-binder-design workflow.
+Results visualization for the [nf-binder-design](https://github.com/Australian-Protein-Design-Initiative/nf-binder-design) workflow.
+
+![nf-binder-vis](docs/images/nf-binder-vis-screenshot.webp)
 
 ## Features
 
