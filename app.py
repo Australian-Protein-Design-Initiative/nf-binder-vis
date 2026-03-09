@@ -125,29 +125,21 @@ def render_molstar_browser(pdb_paths: List[str], height: int = 600) -> None:
     
     pdb_path = pdb_paths[0]
     pdb_file = Path(pdb_path)
-    
-    # Convert CIF to PDB if needed (boltzgen CIF format is non-standard)
-    if pdb_file.suffix.lower() == '.cif':
-        converted_pdb = convert_cif_to_pdb(pdb_path)
-        if converted_pdb:
-            pdb_path = converted_pdb
-            pdb_file = Path(converted_pdb)
-        else:
-            st.warning(f"Could not convert CIF to PDB: {pdb_path}")
-            return
-    
+    is_cif = pdb_file.suffix.lower() == '.cif'
+    data_format = 'cif' if is_cif else 'pdb'
+
     try:
         with open(pdb_path, 'r') as f:
-            pdb_content = f.read()
+            structure_content = f.read()
     except Exception as e:
         st.error(f"Error reading structure file: {e}")
         return
-    
-    # Base64 encode PDB content for safe transmission
-    pdb_b64 = base64.b64encode(pdb_content.encode('utf-8')).decode('ascii')
 
-    # Per-residue B-factor/pLDDT tooltips for highlight hover popup
-    residue_tooltips = parse_pdb_residue_bfactors(pdb_content)
+    structure_b64 = base64.b64encode(structure_content.encode('utf-8')).decode('ascii')
+    if is_cif:
+        residue_tooltips = parse_cif_residue_bfactors(structure_content)
+    else:
+        residue_tooltips = parse_pdb_residue_bfactors(structure_content)
     residue_tooltips_json = json.dumps(residue_tooltips)
     
     # Generate unique container ID for this viewer instance
@@ -190,9 +182,10 @@ def render_molstar_browser(pdb_paths: List[str], height: int = 600) -> None:
             const containerId = "{container_id}";
             const height = {height};
             
-            // Decode base64 PDB content
-            const pdbB64 = "{pdb_b64}";
-            const pdbData = atob(pdbB64);
+            // Decode base64 structure content (PDB or CIF)
+            const structureB64 = "{structure_b64}";
+            const structureData = atob(structureB64);
+            const dataFormat = "{data_format}";
             const residueTooltips = {residue_tooltips_json};
             
             // Wait for Molstar plugin to load, then render
@@ -217,15 +210,15 @@ def render_molstar_browser(pdb_paths: List[str], height: int = 600) -> None:
                     // Create viewer instance
                     const viewer = new PDBeMolstarPlugin();
                     
-                    // Create Blob URL for PDB data
-                    const blob = new Blob([pdbData], {{ type: 'text/plain' }});
+                    // Create Blob URL for structure data (PDB or CIF)
+                    const blob = new Blob([structureData], {{ type: 'text/plain' }});
                     const url = URL.createObjectURL(blob);
                     
                     // Configure viewer options (AlphaFold-style view by default)
                     const options = {{
                         customData: {{
                             url: url,
-                            format: 'pdb',
+                            format: dataFormat,
                             binary: false
                         }},
                         alphafoldView: true,
@@ -365,6 +358,65 @@ def parse_pdb_residue_bfactors(pdb_content: str) -> List[dict]:
     return out
 
 
+def parse_cif_residue_bfactors(cif_content: str) -> List[dict]:
+    """Parse mmCIF _atom_site loop for per-residue B-factor (pLDDT) for Molstar tooltips.
+
+    Returns same structure as parse_pdb_residue_bfactors for visual.tooltips.
+    """
+    seen: dict[tuple[str, int], float] = {}
+    chain_order: list[str] = []
+    col_idx: dict[str, int] = {}
+    in_loop = False
+    for line in cif_content.splitlines():
+        s = line.strip()
+        if s == "loop_":
+            in_loop = True
+            col_idx = {}
+            continue
+        if in_loop and s.startswith("_atom_site."):
+            name = s.split(".", 1)[1].strip()
+            col_idx[name] = len(col_idx)
+            continue
+        if in_loop and s and not s.startswith("_") and not s.startswith("#"):
+            if "label_asym_id" not in col_idx or "label_seq_id" not in col_idx or "B_iso_or_equiv" not in col_idx:
+                in_loop = False
+                continue
+            parts = re.split(r"\s+", s)
+            try:
+                chain = parts[col_idx["label_asym_id"]] if col_idx["label_asym_id"] < len(parts) else ""
+                seq_s = parts[col_idx["label_seq_id"]] if col_idx["label_seq_id"] < len(parts) else ""
+                b_s = parts[col_idx["B_iso_or_equiv"]] if col_idx["B_iso_or_equiv"] < len(parts) else ""
+                if not chain or not seq_s or not b_s:
+                    continue
+                res_seq = int(seq_s)
+                b_factor = float(b_s)
+            except (ValueError, IndexError, KeyError):
+                continue
+            key = (chain, res_seq)
+            if key not in seen:
+                seen[key] = b_factor
+                if chain not in chain_order:
+                    chain_order.append(chain)
+        elif s.startswith("_") or s == "":
+            in_loop = False
+    chain_to_entity = {c: str(i + 1) for i, c in enumerate(chain_order)}
+    out = []
+    for (chain, res_seq), b_factor in sorted(
+        seen.items(),
+        key=lambda x: (chain_order.index(x[0][0]) if x[0][0] in chain_order else 999, x[0][1]),
+    ):
+        entity_id = chain_to_entity.get(chain, "1")
+        label = f"pLDDT: {b_factor:.1f}" if 0 <= b_factor <= 100 else f"B-factor: {b_factor:.1f}"
+        out.append({
+            "entity_id": entity_id,
+            "struct_asym_id": chain,
+            "start_residue_number": res_seq,
+            "end_residue_number": res_seq,
+            "tooltip": label,
+        })
+    return out
+
+
 def convert_cif_to_pdb(cif_path: str) -> Optional[str]:
     """Convert CIF file to PDB format for Molstar visualization.
     
@@ -465,6 +517,9 @@ def extract_backbone_id(design_id: str, method: str) -> str:
     return backbone_id
 
 
+# Directories to skip during recursive walk (common to all signatures)
+DEFAULT_SKIP_DIRS = [".nextflow", "work"]
+
 # Run folder signatures for declarative run detection
 # Each signature defines the structure required to identify a run type
 run_folder_signatures = [
@@ -553,7 +608,7 @@ run_folder_signatures = [
         "results_table_pattern": "final_ranked_designs/final_designs_metrics_*.csv",
         "pdb_pattern": "final_ranked_designs/final_*_designs/*.cif",
         "params_files": [],
-        "skip_dirs": [],
+        "skip_dirs": DEFAULT_SKIP_DIRS,
         # Design parsing configuration
         "design_id_columns": ["id"],
         "primary_score_columns": ["design_to_target_iptm"],
@@ -568,7 +623,6 @@ run_folder_signatures = [
         "method": "boltzgen",
         "submethod": "nf-binder-design",
         "priority": 6,
-        "required_files": ["results/params.json"],
         "required_dirs": ["results/boltzgen/filtered/final_ranked_designs"],
         "required_patterns": [
             "results/boltzgen/filtered/final_ranked_designs/final_designs_metrics_*.csv"
@@ -576,7 +630,29 @@ run_folder_signatures = [
         "results_table_pattern": "results/boltzgen/filtered/final_ranked_designs/final_designs_metrics_*.csv",
         "pdb_pattern": "results/boltzgen/filtered/final_ranked_designs/final_*_designs/*.cif",
         "params_files": ["results/params.json"],
-        "skip_dirs": [],
+        "skip_dirs": DEFAULT_SKIP_DIRS,
+        # Design parsing configuration
+        "design_id_columns": ["id"],
+        "primary_score_columns": ["design_to_target_iptm"],
+        "sort_ascending": False,
+        "structure_file_column": "file_name",
+        "pdb_search_patterns": [
+            "{file_name}",
+            "rank*_{file_name}",
+        ],
+    },
+    {
+        "method": "boltzgen",
+        "submethod": "nf-binder-design",
+        "priority": 7,
+        "required_dirs": ["boltzgen/filtered/final_ranked_designs"],
+        "required_patterns": [
+            "boltzgen/filtered/final_ranked_designs/final_designs_metrics_*.csv"
+        ],
+        "results_table_pattern": "boltzgen/filtered/final_ranked_designs/final_designs_metrics_*.csv",
+        "pdb_pattern": "boltzgen/filtered/final_ranked_designs/final_*_designs/*.cif",
+        "params_files": ["results/params.json"],
+        "skip_dirs": DEFAULT_SKIP_DIRS,
         # Design parsing configuration
         "design_id_columns": ["id"],
         "primary_score_columns": ["design_to_target_iptm"],
@@ -805,10 +881,14 @@ def detect_run_type(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def find_runs_recursive(root_path: Path) -> List[Dict[str, Any]]:
+    skip_dirs_set = set()
+    for sig in run_folder_signatures:
+        skip_dirs_set.update(sig.get("skip_dirs", []))
+
     runs: List[Dict[str, Any]] = []
     for dirpath, dirnames, filenames in os.walk(root_path, followlinks=True):
         current_dir = Path(dirpath)
-        if current_dir.name == "work":
+        if current_dir.name in skip_dirs_set:
             dirnames[:] = []
             continue
 
@@ -1097,9 +1177,16 @@ def parse_designs_from_run(run_metadata: Dict[str, Any]) -> List[Dict[str, Any]]
             pdb_file = _find_structure_file_for_design(
                 Path(run_path), search_value, pdb_search_patterns, structure_base_dir
             )
-            
-            # If still not found and file_name_val exists, store it for frontend resolution
-            if pdb_file is None and file_name_val:
+            # For boltzgen, if filesystem search failed, use file_name from table so the
+            # frontend can request the structure; the structure endpoint will resolve
+            # rank*_{file_name} to the actual file.
+            if (
+                pdb_file is None
+                and run_metadata.get("method") == "boltzgen"
+                and structure_file_column == "file_name"
+                and file_name_val is not None
+                and str(file_name_val).strip()
+            ):
                 pdb_file = str(file_name_val)
 
             # Extract backbone_id for MPNN filtering
@@ -2145,9 +2232,29 @@ def main():
                 design_id_for_warning = row.get("design_id", f"Row index {idx}")
                 if pdb_file_path_str:
                     pdb_path = Path(pdb_file_path_str)
+                    if not pdb_path.exists() and row.get("run_path"):
+                        run_path = Path(row["run_path"])
+                        candidate = run_path / pdb_file_path_str
+                        if candidate.exists():
+                            pdb_path = candidate
+                        elif row.get("method") == "boltzgen":
+                            stem = Path(pdb_file_path_str).stem
+                            for sub in [
+                                "results/boltzgen/filtered/final_ranked_designs",
+                                "boltzgen/filtered/final_ranked_designs",
+                            ]:
+                                base = run_path / sub
+                                for d in base.glob("final_*_designs"):
+                                    if d.is_dir():
+                                        matches = list(d.glob(f"*{stem}*.cif"))
+                                        if matches:
+                                            pdb_path = matches[0]
+                                            break
+                                if pdb_path.exists():
+                                    break
                     if pdb_path.exists():
                         pdb_paths_to_view.append(str(pdb_path))
-                    else:
+                    elif pdb_file_path_str:
                         st.warning(
                             f"PDB file not found for {design_id_for_warning}: {pdb_path}"
                         )
