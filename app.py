@@ -7,7 +7,6 @@
 #     "pandas",
 #     "seaborn",
 #     "streamlit>=1.32.0",
-#     "streamlit-molstar",
 # ]
 # ///
 
@@ -19,17 +18,387 @@ import json
 import logging
 from pathlib import Path
 import argparse
+
+# Suppress "missing ScriptRunContext" when running as python app.py (we delegate to streamlit run)
+class _ScriptRunContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = getattr(record, "msg", "") or ""
+        if "missing ScriptRunContext" in str(msg) and "bare mode" in str(msg).lower():
+            return False
+        return True
+
+_script_run_ctx_filter = _ScriptRunContextFilter()
+logging.getLogger().addFilter(_script_run_ctx_filter)
+
 import pandas as pd
 import streamlit as st
+# Ensure Streamlit's own logger also filters this warning (it may not propagate)
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").addFilter(
+    _script_run_ctx_filter
+)
 import seaborn as sns
 import matplotlib.pyplot as plt
 import altair as alt
 import numpy as np
 from typing import Optional, List, Any, Tuple, Dict
-from streamlit_molstar import st_molstar, st_molstar_rcsb, st_molstar_remote
-from streamlit_molstar.auto import st_molstar_auto
+
+# Detect if running in stlite/Pyodide environment
+def is_stlite() -> bool:
+    """Check if running in stlite/Pyodide browser environment."""
+    try:
+        import sys
+        return "pyodide" in sys.modules or "js" in sys.modules
+    except Exception:
+        return False
+
+IS_STLITE = is_stlite()
+
+
+# Mount point for File System Access API (browser mode)
+BROWSER_MOUNT_PATH = "/data"
+
+# Track which files have been loaded on-demand (browser mode)
+_loaded_files: set = set()
+_previous_structure_file: Optional[str] = None
+
+
+def ensure_file_loaded(file_path: Path) -> bool:
+    """Request a file to be loaded on-demand in browser mode.
+    
+    In browser mode, large files (like PDB) are not copied upfront to save memory.
+    This function requests the parent window to load the file and returns True
+    once the file has real content (not just a placeholder).
+    
+    Args:
+        file_path: Path to the file (should be under BROWSER_MOUNT_PATH)
+        
+    Returns:
+        True if file is ready to read, False if still loading
+    """
+    global _loaded_files
+    
+    if not IS_STLITE:
+        return True  # Native mode - files are always accessible
+    
+    path_str = str(file_path)
+    
+    # Check if file is already loaded
+    if path_str in _loaded_files:
+        return True
+    
+    # Check if file has real content (not just a 1-byte placeholder)
+    try:
+        if file_path.exists() and file_path.stat().st_size > 1:
+            _loaded_files.add(path_str)
+            return True
+    except Exception:
+        pass
+    
+    # Request the file to be loaded via JavaScript
+    st.components.v1.html(f"""
+        <script>
+            window.parent.postMessage({{
+                type: 'loadFile',
+                path: '{path_str}'
+            }}, '*');
+        </script>
+    """, height=0)
+    
+    return False
+
+
+def render_molstar_browser(pdb_paths: List[str], height: int = 600) -> None:
+    """Render PDB structure(s) using PDBe Molstar in browser mode.
+    
+    This injects Molstar viewer directly into the iframe to avoid
+    cross-frame communication issues.
+    
+    Args:
+        pdb_paths: List of paths to PDB/CIF files to display
+        height: Height of the viewer in pixels
+    """
+    import base64
+    
+    # For now, only display first structure
+    if not pdb_paths:
+        return
+    
+    pdb_path = pdb_paths[0]
+    pdb_file = Path(pdb_path)
+    
+    # Convert CIF to PDB if needed (boltzgen CIF format is non-standard)
+    if pdb_file.suffix.lower() == '.cif':
+        converted_pdb = convert_cif_to_pdb(pdb_path)
+        if converted_pdb:
+            pdb_path = converted_pdb
+            pdb_file = Path(converted_pdb)
+        else:
+            st.warning(f"Could not convert CIF to PDB: {pdb_path}")
+            return
+    
+    try:
+        with open(pdb_path, 'r') as f:
+            pdb_content = f.read()
+    except Exception as e:
+        st.error(f"Error reading structure file: {e}")
+        return
+    
+    # Base64 encode PDB content for safe transmission
+    pdb_b64 = base64.b64encode(pdb_content.encode('utf-8')).decode('ascii')
+
+    # Per-residue B-factor/pLDDT tooltips for highlight hover popup
+    residue_tooltips = parse_pdb_residue_bfactors(pdb_content)
+    residue_tooltips_json = json.dumps(residue_tooltips)
+    
+    # Generate unique container ID for this viewer instance
+    container_id = f"molstar-viewer-{uuid.uuid4().hex[:8]}"
+    
+    # Render Molstar viewer directly in iframe (no parent window communication needed)
+    html_content = f"""
+    <style>
+        #{container_id} {{
+            width: 100%;
+            height: {height}px;
+            position: relative;
+            background-color: #ffffff;
+            border-radius: 4px;
+            overflow: hidden;
+        }}
+        #molstar-loading {{
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #333333;
+            font-family: "Source Sans Pro", sans-serif;
+            font-size: 14px;
+        }}
+        #molstar-error {{
+            color: #ff4b4b;
+            padding: 20px;
+            text-align: center;
+            font-family: "Source Sans Pro", sans-serif;
+        }}
+    </style>
+    <div id="{container_id}">
+        <div id="molstar-loading">Loading 3D structure viewer...</div>
+    </div>
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/pdbe-molstar@3.8.0/build/pdbe-molstar-light.css">
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/pdbe-molstar@3.8.0/build/pdbe-molstar-plugin.js"></script>
+    <script>
+        (function() {{
+            const containerId = "{container_id}";
+            const height = {height};
+            
+            // Decode base64 PDB content
+            const pdbB64 = "{pdb_b64}";
+            const pdbData = atob(pdbB64);
+            const residueTooltips = {residue_tooltips_json};
+            
+            // Wait for Molstar plugin to load, then render
+            function renderViewer() {{
+                if (typeof PDBeMolstarPlugin === 'undefined') {{
+                    // Molstar not loaded yet, retry in 100ms
+                    setTimeout(renderViewer, 100);
+                    return;
+                }}
+                
+                const container = document.getElementById(containerId);
+                if (!container) {{
+                    console.error('Container not found:', containerId);
+                    return;
+                }}
+                
+                try {{
+                    // Clear loading text
+                    container.innerHTML = '';
+                    container.style.backgroundColor = '#ffffff';
+                    
+                    // Create viewer instance
+                    const viewer = new PDBeMolstarPlugin();
+                    
+                    // Create Blob URL for PDB data
+                    const blob = new Blob([pdbData], {{ type: 'text/plain' }});
+                    const url = URL.createObjectURL(blob);
+                    
+                    // Configure viewer options (AlphaFold-style view by default)
+                    const options = {{
+                        customData: {{
+                            url: url,
+                            format: 'pdb',
+                            binary: false
+                        }},
+                        alphafoldView: true,
+                        hideCanvasControls: ['expand', 'animation', 'trajectory'],
+                        landscape: true,
+                        sequencePanel: true,
+                        pdbeLink: false,
+                        leftPanel: true,
+                        rightPanel: true
+                    }};
+                    
+                    // Render viewer
+                    viewer.render(container, options);
+                    viewer.events.loadComplete.subscribe(function() {{
+                        viewer.canvas.setBgColor({{ r: 255, g: 255, b: 255 }});
+                        if (residueTooltips && residueTooltips.length > 0) {{
+                            viewer.visual.tooltips({{ data: residueTooltips }}).catch(function() {{}});
+                        }}
+                    }});
+                    console.log('Molstar viewer rendered successfully');
+                    
+                    // Clean up Blob URL after delay
+                    setTimeout(function() {{ URL.revokeObjectURL(url); }}, 60000);
+                }} catch (err) {{
+                    console.error('Error rendering Molstar viewer:', err);
+                    container.innerHTML = '<div id="molstar-error">Error loading 3D viewer: ' + err.message + '</div>';
+                }}
+            }}
+            
+            // Start rendering when DOM is ready
+            if (document.readyState === 'loading') {{
+                document.addEventListener('DOMContentLoaded', renderViewer);
+            }} else {{
+                renderViewer();
+            }}
+        }})();
+    </script>
+    """
+    
+    st.components.v1.html(html_content, height=height + 10)
+    
+    # Show file name for reference
+    st.caption(f"📁 {Path(pdb_path).name}")
+    
+    # Show additional files if multiple selected
+    if len(pdb_paths) > 1:
+        other_files = [Path(p).name for p in pdb_paths[1:]]
+        st.caption(f"Additional files: {', '.join(other_files)}")
+
+
+def unload_previous_structure(current_file: Path) -> None:
+    """Unload the previously viewed structure file to free memory.
+    
+    In browser mode, we only keep one structure file loaded at a time.
+    """
+    global _previous_structure_file, _loaded_files
+    
+    if not IS_STLITE:
+        return
+    
+    current_str = str(current_file)
+    
+    if _previous_structure_file and _previous_structure_file != current_str:
+        # Request unload via JavaScript
+        st.components.v1.html(f"""
+            <script>
+                window.parent.postMessage({{
+                    type: 'unloadFile',
+                    path: '{_previous_structure_file}'
+                }}, '*');
+            </script>
+        """, height=0)
+        
+        # Remove from loaded set
+        _loaded_files.discard(_previous_structure_file)
+    
+    _previous_structure_file = current_str
+
 
 logger = logging.getLogger(__name__)
+
+# Try to import BioPython for CIF-to-PDB conversion
+try:
+    from Bio.PDB import MMCIFParser, PDBIO
+    HAS_BIOPYTHON = True
+except Exception as e:
+    HAS_BIOPYTHON = False
+    logging.warning(f"BioPython not available for CIF conversion: {e}")
+
+
+def parse_pdb_residue_bfactors(pdb_content: str) -> List[dict]:
+    """Parse PDB ATOM lines to extract per-residue B-factor (pLDDT) for Molstar tooltips.
+
+    Returns a list of dicts suitable for PDBe Molstar visual.tooltips({ data: [...] }):
+    each has entity_id, struct_asym_id, start_residue_number, end_residue_number, tooltip.
+    B-factor is shown as pLDDT when in 0-100 range (AlphaFold convention), else as B-factor.
+    """
+    # PDB fixed columns: chain 22, res seq 23-26, B-factor 61-66 (0-based: 21, 22:26, 60:66)
+    seen: dict[tuple[str, int], float] = {}
+    chain_order: list[str] = []
+    for line in pdb_content.splitlines():
+        if not line.startswith("ATOM ") and not line.startswith("HETATM"):
+            continue
+        if len(line) < 66:
+            continue
+        try:
+            chain = line[21].strip() or " "
+            res_seq_s = line[22:26].strip()
+            b_factor_s = line[60:66].strip()
+            if not res_seq_s or not b_factor_s:
+                continue
+            res_seq = int(res_seq_s)
+            b_factor = float(b_factor_s)
+        except (ValueError, IndexError):
+            continue
+        key = (chain, res_seq)
+        if key not in seen:
+            seen[key] = b_factor
+            if chain not in chain_order:
+                chain_order.append(chain)
+    # Build tooltip params: entity_id from chain order (1-based), struct_asym_id = chain
+    chain_to_entity = {c: str(i + 1) for i, c in enumerate(chain_order)}
+    out = []
+    for (chain, res_seq), b_factor in sorted(seen.items(), key=lambda x: (chain_order.index(x[0][0]) if x[0][0] in chain_order else 999, x[0][1])):
+        entity_id = chain_to_entity.get(chain, "1")
+        if 0 <= b_factor <= 100:
+            label = f"pLDDT: {b_factor:.1f}"
+        else:
+            label = f"B-factor: {b_factor:.1f}"
+        out.append({
+            "entity_id": entity_id,
+            "struct_asym_id": chain,
+            "start_residue_number": res_seq,
+            "end_residue_number": res_seq,
+            "tooltip": label,
+        })
+    return out
+
+
+def convert_cif_to_pdb(cif_path: str) -> Optional[str]:
+    """Convert CIF file to PDB format for Molstar visualization.
+    
+    Boltzgen CIF files use non-standard field names (e.g., _cell.length_a instead of _cell.length_a)
+    that Molstar cannot parse. This function converts them to standard PDB format.
+    
+    Args:
+        cif_path: Path to CIF file
+        
+    Returns:
+        Path to PDB file, or None if conversion fails
+    """
+    try:
+        from Bio.PDB import MMCIFParser, PDBIO
+        
+        cif_file_obj = Path(cif_path)
+        pdb_path = cif_file_obj.with_suffix('.pdb')
+        
+        parser = MMCIFParser()
+        structure = parser.get_structure('temp', cif_path)
+        
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(str(pdb_path))
+        
+        logger.info(f"Converted CIF to PDB: {cif_path} -> {pdb_path}")
+        return str(pdb_path)
+    except ImportError:
+        logger.warning(f"BioPython not available for CIF to PDB conversion")
+        return None
+    except Exception as e:
+        logger.error(f"Error converting CIF to PDB {cif_path}: {str(e)}")
+        return None
+
 
 # --- Constants for column names ---
 DEFAULT_SORT_COLUMN = "Average_i_pTM"
@@ -173,6 +542,51 @@ run_folder_signatures = [
         "sort_ascending": True,
         "pdb_search_patterns": ["{design_id}.pdb"],
     },
+    {
+        "method": "boltzgen",
+        "submethod": "vanilla",
+        "priority": 5,
+        "required_dirs": ["final_ranked_designs"],
+        "required_patterns": [
+            "final_ranked_designs/final_designs_metrics_*.csv"
+        ],
+        "results_table_pattern": "final_ranked_designs/final_designs_metrics_*.csv",
+        "pdb_pattern": "final_ranked_designs/final_*_designs/*.cif",
+        "params_files": [],
+        "skip_dirs": [],
+        # Design parsing configuration
+        "design_id_columns": ["id"],
+        "primary_score_columns": ["design_to_target_iptm"],
+        "sort_ascending": False,
+        "structure_file_column": "file_name",
+        "pdb_search_patterns": [
+            "{file_name}",
+            "rank*_{file_name}",
+        ],
+    },
+    {
+        "method": "boltzgen",
+        "submethod": "nf-binder-design",
+        "priority": 6,
+        "required_files": ["results/params.json"],
+        "required_dirs": ["results/boltzgen/filtered/final_ranked_designs"],
+        "required_patterns": [
+            "results/boltzgen/filtered/final_ranked_designs/final_designs_metrics_*.csv"
+        ],
+        "results_table_pattern": "results/boltzgen/filtered/final_ranked_designs/final_designs_metrics_*.csv",
+        "pdb_pattern": "results/boltzgen/filtered/final_ranked_designs/final_*_designs/*.cif",
+        "params_files": ["results/params.json"],
+        "skip_dirs": [],
+        # Design parsing configuration
+        "design_id_columns": ["id"],
+        "primary_score_columns": ["design_to_target_iptm"],
+        "sort_ascending": False,
+        "structure_file_column": "file_name",
+        "pdb_search_patterns": [
+            "{file_name}",
+            "rank*_{file_name}",
+        ],
+    },
 ]
 
 
@@ -184,6 +598,7 @@ def guess_project_id(path: Path) -> str:
         r"^batch.*$",
         r"^bindcraft$",
         r"^rfd$",
+        r"^boltzgen$",
         r"^\d+$",
     ]
 
@@ -206,7 +621,7 @@ def guess_project_id(path: Path) -> str:
 
 
 def guess_run_name(path: Path) -> str:
-    disallowed_patterns = [r"^results.*$", r"^bindcraft$", r"^batches$", r"^\d+$"]
+    disallowed_patterns = [r"^results.*$", r"^bindcraft$", r"^batches$", r"^rfd$", r"^boltzgen$", r"^\d+$"]
     current_path = path
     while current_path != current_path.parent:
         name = current_path.name
@@ -244,19 +659,79 @@ def _check_required_patterns(path: Path, required_patterns: List[str]) -> bool:
     return False
 
 
-def _find_pdb_file_for_design(
-    run_path: Path, design_id: str, pdb_search_patterns: List[str], pdb_base_dir: str
+def _find_structure_file_for_design(
+    run_path: Path,
+    search_value: str,
+    search_patterns: List[str],
+    structure_base_dir: str,
 ) -> Optional[str]:
-    """Find the PDB file for a design using the search patterns."""
-    pdb_dir = run_path / pdb_base_dir
-    if not pdb_dir.exists():
-        return None
-
-    for pattern in pdb_search_patterns:
-        search_pattern = pattern.format(design_id=design_id)
-        matches = list(pdb_dir.glob(search_pattern))
-        if matches:
-            return str(matches[0])
+    """Find structure file for a design using search patterns."""
+    search_dirs: List[Path] = []
+    
+    # Handle wildcard in structure_base_dir (e.g., "final_*_designs/*.cif")
+    if "*" in structure_base_dir:
+        # Split at last wildcard to get parent pattern including wildcard
+        # e.g., "final_ranked_designs/final_*_designs/*.cif" -> "final_ranked_designs/*"
+        parts = structure_base_dir.rsplit("*", 1)
+        parent_pattern = parts[0] + "*" if parts[1] else ""
+        glob_pattern = parts[1] if len(parts) > 1 else ""
+        
+        for d in run_path.glob(parent_pattern):
+            if d.is_dir():
+                search_dirs.append(d)
+    else:
+        base_dir = run_path / structure_base_dir
+        if base_dir.is_dir():
+            search_dirs.append(base_dir)
+    
+    # First, try exact match with search_value (e.g., file_name from CSV)
+    if search_value and not search_value.endswith(('.pdb', '.cif')):
+        # search_value is just filename without extension
+        # Try exact match first
+        for base_dir in search_dirs:
+            exact_match = base_dir / search_value
+            if exact_match.is_file():
+                return str(exact_match)
+    elif search_value and (search_value.endswith('.pdb') or search_value.endswith('.cif')):
+        # search_value is full filename with extension
+        # Try exact match first
+        for base_dir in search_dirs:
+            exact_match = base_dir / search_value
+            if exact_match.is_file():
+                return str(exact_match)
+    
+    # If exact match fails, use glob patterns
+    for base_dir in search_dirs:
+        for pattern in search_patterns:
+            try:
+                # Support both {design_id} and {file_name} placeholders
+                # For boltzgen with rank prefixes, use basename instead of full filename
+                if '{file_name}' in pattern and search_value and search_value.endswith(('.pdb', '.cif')):
+                    # Extract basename (filename without extension) for pattern
+                    search_stem = Path(search_value).stem
+                    search_pattern = pattern.format(design_id=search_value, file_name=search_stem)
+                else:
+                    search_pattern = pattern.format(design_id=search_value, file_name=search_value)
+            except KeyError:
+                search_pattern = pattern.format(design_id=search_value)
+            
+            # For boltzgen, also try substring search if exact fails
+            # This handles rank prefixes (e.g., "rank01_filename.cif")
+            matches = list(base_dir.glob(search_pattern))
+            if matches:
+                return str(matches[0])
+            
+            # Special case for boltzgen: search for any file containing search_value
+            # This handles rank prefixes (e.g., "rank01_filename.cif")
+            if not matches:
+                # Extract basename without extension for matching
+                search_basename = Path(search_value).stem
+                # Glob pattern: *{basename}*.cif to match files containing the basename and ending with .cif
+                # This will match rank01_perfluorooctanoic-acid_33.cif when searching for perfluorooctanoic-acid_33.cif
+                substring_matches = list(base_dir.glob(f"*{search_basename}*.cif"))
+                if substring_matches:
+                    # Return first match that contains CSV filename as substring
+                    return str(substring_matches[0])
     return None
 
 
@@ -299,8 +774,32 @@ def detect_run_type(path: Path) -> Optional[Dict[str, Any]]:
             if not (combined_file.is_file() or cs_files_scores or cs_files_root):
                 continue
 
+        # Resolve any dynamic patterns to concrete values for this path
+        resolved_signature = dict(signature)
+
+        # Resolve results table from pattern, if provided
+        results_table_pattern = resolved_signature.get("results_table_pattern")
+        if results_table_pattern and not resolved_signature.get("results_table"):
+            matches = sorted(path.glob(results_table_pattern))
+            if not matches:
+                # No concrete table found for this signature
+                continue
+            # Prefer match with highest numeric suffix by simple name sort
+            selected = matches[-1]
+            try:
+                rel_table = selected.relative_to(path)
+            except ValueError:
+                rel_table = selected
+            resolved_signature["results_table"] = str(rel_table)
+
+        # Resolve structure pattern to a concrete glob pattern for this run (used for listing files)
+        structure_pattern = resolved_signature.get("structure_pattern")
+        if structure_pattern and not resolved_signature.get("pdb_pattern"):
+            # Keep the relative glob pattern; find_runs_recursive will use it directly
+            resolved_signature["pdb_pattern"] = structure_pattern
+
         # If we get here, this signature matches
-        return {**signature, "run_name": run_name, "detected_path": str(path)}
+        return {**resolved_signature, "run_name": run_name, "detected_path": str(path)}
 
     return None
 
@@ -342,8 +841,8 @@ def find_runs_recursive(root_path: Path) -> List[Dict[str, Any]]:
             results_table = detected_run["results_table"]
             pdb_pattern = detected_run["pdb_pattern"]
 
-            # Find PDB files using the pattern
-            pdb_files = [str(p) for p in current_dir.glob(pdb_pattern)]
+            # Find structure files using the pattern
+            structure_files = [str(p) for p in current_dir.glob(detected_run.get("pdb_pattern", ""))]
 
             # Determine if this is an nf-binder-design run
             is_nf_binder_design = detected_run["submethod"] == "nf-binder-design"
@@ -356,14 +855,14 @@ def find_runs_recursive(root_path: Path) -> List[Dict[str, Any]]:
                     "method": detected_run["method"],
                     "submethod": detected_run["submethod"],
                     "results_table": results_table,
-                    "pdb_files": pdb_files,
+                    "structure_files": structure_files,
                     "is_nf_binder_design": is_nf_binder_design,
-                    "signature": detected_run,  # Store the full signature for use in parse_designs_from_run
+                    "signature": detected_run,  # Store of full signature for use in parse_designs_from_run
                     "metadata": {
                         "name": run_name,
                         "original_name": current_dir.name,
                         "parent_path": str(current_dir.parent),
-                        "pdb_count": len(pdb_files),
+                        "pdb_count": len(structure_files),
                     },
                 }
             )
@@ -565,22 +1064,43 @@ def parse_designs_from_run(run_metadata: Dict[str, Any]) -> List[Dict[str, Any]]
 
         # Determine PDB base directory from the pdb_pattern
         pdb_pattern = signature.get("pdb_pattern", "")
-        pdb_base_dir = pdb_pattern.split("/*.pdb")[0] if "/*.pdb" in pdb_pattern else ""
-
+        structure_base_dir = ""
+        if "/*.pdb" in pdb_pattern:
+            structure_base_dir = pdb_pattern.split("/*.pdb")[0]
+        elif "/*.cif" in pdb_pattern:
+            structure_base_dir = pdb_pattern.split("/*.cif")[0]
+        
         # Parse any run-wide parameters/settings; will be attached as a single 'params' field
         run_params: Optional[Any] = parse_run_params(run_metadata)
-
+        
+        # Get file_name from CSV for boltzgen
+        structure_file_column = signature.get("structure_file_column")
+        
         for index, row in df.iterrows():
             design_id = (
                 str(row.get(design_id_col, f"design_{index}"))
                 if design_id_col
                 else f"design_{index}"
             )
-
-            # Find PDB file using signature configuration
-            pdb_file = _find_pdb_file_for_design(
-                Path(run_path), design_id, pdb_search_patterns, pdb_base_dir
+            
+            # For boltzgen, get file_name from CSV
+            file_name_val = None
+            if structure_file_column and structure_file_column in df.columns:
+                file_name_val = row.get(structure_file_column)
+                if file_name_val is not None and str(file_name_val).strip():
+                    file_name_val = str(file_name_val)
+            
+            # For structure file search, prefer file_name over design_id
+            search_value = file_name_val if file_name_val else design_id
+            
+            # Find structure file using signature configuration
+            pdb_file = _find_structure_file_for_design(
+                Path(run_path), search_value, pdb_search_patterns, structure_base_dir
             )
+            
+            # If still not found and file_name_val exists, store it for frontend resolution
+            if pdb_file is None and file_name_val:
+                pdb_file = str(file_name_val)
 
             # Extract backbone_id for MPNN filtering
             backbone_id = extract_backbone_id(design_id, run_metadata["method"])
@@ -838,107 +1358,6 @@ def main():
     if "df" not in st.session_state:
         st.session_state.df = None
 
-    # Sidebar for path input and regenerate button
-    with st.sidebar:
-        st.header("Results Directory")
-        st.info(f"Searching in: {st.session_state.root_search_path}")
-        st.markdown(
-            "To change the search directory, please restart the app with the desired `--path` argument."
-        )
-        st.divider()
-
-        # Exclude folders input
-        st.subheader("Scan Settings")
-        exclude_folders_text = st.text_input(
-            "Exclude folders (comma separated)",
-            value="work",
-            help="Folders to exclude when scanning for results. Separate multiple folders with commas.",
-        )
-        # Parse the exclude folders text into a list
-        exclude_folders = [
-            folder.strip()
-            for folder in exclude_folders_text.split(",")
-            if folder.strip()
-        ]
-        st.divider()
-
-        if st.button(
-            "🔄 Regenerate Summary File",
-            help="Re-scans the directory, merges existing 'good' ratings, and overwrites designs_summary.tsv",
-        ):
-            with st.spinner("Regenerating summary file..."):
-                # Force a re-scan and merge by temporarily setting df to None in session_state
-                current_summary_df = None
-                if summary_file_path.exists():
-                    try:
-                        current_summary_df = pd.read_csv(summary_file_path, sep="\t")
-                    except Exception as e:
-                        st.warning(
-                            f"Could not read existing summary file for regeneration: {e}"
-                        )
-
-                fresh_df = load_all_designs(
-                    st.session_state.root_search_path, exclude_folders
-                )
-                if fresh_df is not None:
-                    if "good" not in fresh_df.columns:
-                        insert_pos = 1 if len(fresh_df.columns) > 0 else 0
-                        fresh_df.insert(insert_pos, "good", False)
-                    else:
-                        fresh_df["good"] = fresh_df["good"].fillna(False).astype(bool)
-
-                    if (
-                        current_summary_df is not None
-                        and "design_id" in current_summary_df.columns
-                        and "run_path" in current_summary_df.columns
-                        and "good" in current_summary_df.columns
-                    ):
-                        good_stamps_to_merge = current_summary_df[
-                            ["design_id", "run_path", "good"]
-                        ].drop_duplicates(
-                            subset=["design_id", "run_path"], keep="first"
-                        )
-
-                        if "good" in fresh_df.columns:
-                            fresh_df = fresh_df.drop(columns=["good"])
-
-                        fresh_df = pd.merge(
-                            fresh_df,
-                            good_stamps_to_merge,
-                            on=["design_id", "run_path"],
-                            how="left",
-                        )
-                        fresh_df["good"] = fresh_df["good"].fillna(False).astype(bool)
-
-                    # With 'good' status merged, we need to recalculate good_rank
-                    fresh_df = update_good_rank(fresh_df)
-
-                    st.session_state.df = fresh_df
-                    try:
-                        st.session_state.df.drop(
-                            columns=["good_rank"], errors="ignore"
-                        ).to_csv(summary_file_path, sep="\t", index=False)
-                        st.success("Summary file regenerated and saved.")
-                    except Exception as e:
-                        st.error(f"Error saving regenerated summary file: {e}")
-
-                    st.session_state.selected_df_indices = []
-                    if "good" in st.session_state.df.columns:
-                        st.session_state.good_values = pd.Series(
-                            st.session_state.df["good"],
-                            index=st.session_state.df.index,
-                            dtype=bool,
-                        )
-                    else:
-                        st.session_state.good_values = pd.Series(
-                            [False] * len(st.session_state.df),
-                            index=st.session_state.df.index,
-                            dtype=bool,
-                        )
-                    st.rerun()
-                else:
-                    st.error("Failed to load data during regeneration scan.")
-
     # Attempt to load data: either from existing session_state.df (if already loaded/regenerated),
     # or from summary file, or by scanning if summary doesn't exist.
     if st.session_state.df is None:
@@ -1012,7 +1431,7 @@ def main():
         # If df is still None (summary didn't exist or failed to load), then perform initial scan and create summary.
         if st.session_state.df is None:
             st.session_state.df = load_all_designs(
-                st.session_state.root_search_path, exclude_folders
+                st.session_state.root_search_path, ["work"]
             )
             if st.session_state.df is not None:
                 # Ensure 'good' column exists before first save
@@ -1035,11 +1454,160 @@ def main():
 
     df = st.session_state.df
 
+    def _render_sidebar_results_directory(exclude_folders_value: str = "work"):
+        st.header("Results Directory")
+        st.info(f"Searching in: {st.session_state.root_search_path}")
+        st.markdown(
+            "To change the search directory, please restart the app with the desired `--path` argument."
+        )
+        st.divider()
+        st.subheader("Scan Settings")
+        exclude_folders_text = st.text_input(
+            "Exclude folders (comma separated)",
+            value=exclude_folders_value,
+            help="Folders to exclude when scanning for results. Separate multiple folders with commas.",
+        )
+        exclude_folders = [
+            folder.strip()
+            for folder in exclude_folders_text.split(",")
+            if folder.strip()
+        ]
+        st.divider()
+        if st.button(
+            "🔄 Regenerate Summary File",
+            help="Re-scans the directory, merges existing 'good' ratings, and overwrites designs_summary.tsv",
+        ):
+            with st.spinner("Regenerating summary file..."):
+                current_summary_df = None
+                if summary_file_path.exists():
+                    try:
+                        current_summary_df = pd.read_csv(summary_file_path, sep="\t")
+                    except Exception as e:
+                        st.warning(
+                            f"Could not read existing summary file for regeneration: {e}"
+                        )
+                fresh_df = load_all_designs(
+                    st.session_state.root_search_path, exclude_folders
+                )
+                if fresh_df is not None:
+                    if "good" not in fresh_df.columns:
+                        insert_pos = 1 if len(fresh_df.columns) > 0 else 0
+                        fresh_df.insert(insert_pos, "good", False)
+                    else:
+                        fresh_df["good"] = fresh_df["good"].fillna(False).astype(bool)
+                    if (
+                        current_summary_df is not None
+                        and "design_id" in current_summary_df.columns
+                        and "run_path" in current_summary_df.columns
+                        and "good" in current_summary_df.columns
+                    ):
+                        good_stamps_to_merge = current_summary_df[
+                            ["design_id", "run_path", "good"]
+                        ].drop_duplicates(
+                            subset=["design_id", "run_path"], keep="first"
+                        )
+                        if "good" in fresh_df.columns:
+                            fresh_df = fresh_df.drop(columns=["good"])
+                        fresh_df = pd.merge(
+                            fresh_df,
+                            good_stamps_to_merge,
+                            on=["design_id", "run_path"],
+                            how="left",
+                        )
+                        fresh_df["good"] = fresh_df["good"].fillna(False).astype(bool)
+                    fresh_df = update_good_rank(fresh_df)
+                    st.session_state.df = fresh_df
+                    try:
+                        st.session_state.df.drop(
+                            columns=["good_rank"], errors="ignore"
+                        ).to_csv(summary_file_path, sep="\t", index=False)
+                        st.success("Summary file regenerated and saved.")
+                    except Exception as e:
+                        st.error(f"Error saving regenerated summary file: {e}")
+                    st.session_state.selected_df_indices = []
+                    if "good" in st.session_state.df.columns:
+                        st.session_state.good_values = pd.Series(
+                            st.session_state.df["good"],
+                            index=st.session_state.df.index,
+                            dtype=bool,
+                        )
+                    else:
+                        st.session_state.good_values = pd.Series(
+                            [False] * len(st.session_state.df),
+                            index=st.session_state.df.index,
+                            dtype=bool,
+                        )
+                    st.rerun()
+                else:
+                    st.error("Failed to load data during regeneration scan.")
+
     if df is None:
+        with st.sidebar:
+            _render_sidebar_results_directory()
         st.warning(
             "No design data loaded. Please ensure the specified path contains valid run directories."
         )
         return
+
+    with st.sidebar:
+        primary_idx_sidebar = (
+            st.session_state.selected_df_indices[0]
+            if st.session_state.selected_df_indices
+            else None
+        )
+        if (
+            primary_idx_sidebar is not None
+            and len(st.session_state.selected_df_indices) == 1
+        ):
+            st.subheader("Selected Structure")
+            selected_row_for_info = df.iloc[primary_idx_sidebar]
+            design_id = selected_row_for_info.get("design_id", "")
+            run_name = selected_row_for_info.get("run_name", "")
+            project_id = selected_row_for_info.get("project_id", "")
+            rank_value = selected_row_for_info.get("Rank", primary_idx_sidebar + 1)
+            ipTM_value = selected_row_for_info.get("Average_i_pTM", "N/A")
+            pae_value = selected_row_for_info.get("pae_interaction", "N/A")
+            ipTM_text = "N/A"
+            if isinstance(ipTM_value, (float, int)):
+                ipTM_text = f"{ipTM_value:.3f}"
+            elif ipTM_value != "N/A":
+                ipTM_text = str(ipTM_value)
+            pae_text = "N/A"
+            if isinstance(pae_value, (float, int)):
+                pae_text = f"{pae_value:.3f}"
+            elif pae_value != "N/A":
+                pae_text = str(pae_value)
+            good_status = selected_row_for_info.get("good", False)
+            good_status_emoji = "✅" if good_status else "❌"
+            table_data = {
+                "Attribute": [
+                    "Rank:",
+                    "Design:",
+                    "Run:",
+                    "Project:",
+                    "Average_i_pTM:",
+                    "PAE Interaction:",
+                    f"Good ({len(df[df['good'] == True])}/{len(df)}):",
+                ],
+                "Value": [
+                    f"{rank_value}/{len(df)}",
+                    design_id,
+                    run_name,
+                    project_id,
+                    ipTM_text,
+                    pae_text,
+                    good_status_emoji,
+                ],
+            }
+            df_info_table = pd.DataFrame(table_data)
+            st.markdown(
+                df_info_table.to_html(
+                    index=False, header=False, border=0, classes=["no-header-table"]
+                ),
+                unsafe_allow_html=True,
+            )
+        st.divider()
+        _render_sidebar_results_directory()
 
     # Initialize or sync 'good_values' session state with the current df's 'good' column
     if "good" in df.columns:
@@ -1121,7 +1689,6 @@ def main():
     # Initialize session state for "Show good only" filter
     if "show_good_only" not in st.session_state:
         st.session_state.show_good_only = False
-
     # Prepare DataFrame for the data_editor: add a selection column
     df_for_editor = df.copy()
     selection_col_name = "✔️ Select"
@@ -1540,58 +2107,7 @@ def main():
                 primary_idx_for_nav is not None
                 and len(st.session_state.selected_df_indices) == 1
             ):
-                selected_row_for_info = df.iloc[primary_idx_for_nav]
-                design_id = selected_row_for_info.get("design_id", "")
-                run_name = selected_row_for_info.get("run_name", "")
-                project_id = selected_row_for_info.get("project_id", "")
-                rank_value = selected_row_for_info.get("Rank", primary_idx_for_nav + 1)
-
-                # Get both score types if present
-                ipTM_value = selected_row_for_info.get("Average_i_pTM", "N/A")
-                pae_value = selected_row_for_info.get("pae_interaction", "N/A")
-
-                ipTM_text = "N/A"
-                if isinstance(ipTM_value, (float, int)):
-                    ipTM_text = f"{ipTM_value:.3f}"
-                elif ipTM_value != "N/A":
-                    ipTM_text = str(ipTM_value)
-
-                pae_text = "N/A"
-                if isinstance(pae_value, (float, int)):
-                    pae_text = f"{pae_value:.3f}"
-                elif pae_value != "N/A":
-                    pae_text = str(pae_value)
-
-                good_status = selected_row_for_info.get("good", False)
-                good_status_emoji = "✅" if good_status else "❌"
-
-                table_data = {
-                    "Attribute": [
-                        "Rank:",
-                        "Design:",
-                        "Run:",
-                        "Project:",
-                        "Average_i_pTM:",
-                        "PAE Interaction:",
-                        f"Good ({len(df[df['good'] == True])}/{len(df)}):",
-                    ],
-                    "Value": [
-                        f"{rank_value}/{len(df)}",
-                        design_id,
-                        run_name,
-                        project_id,
-                        ipTM_text,
-                        pae_text,
-                        good_status_emoji,
-                    ],
-                }
-                df_info_table = pd.DataFrame(table_data)
-                st.markdown(
-                    df_info_table.to_html(
-                        index=False, header=False, border=0, classes=["no-header-table"]
-                    ),
-                    unsafe_allow_html=True,
-                )
+                st.caption("Details in sidebar →")
             elif len(st.session_state.selected_df_indices) > 1:
                 st.markdown(
                     f"_{len(st.session_state.selected_df_indices)} structures selected_"
@@ -1643,10 +2159,7 @@ def main():
                 st.warning(f"Invalid index {idx} in selection list.")
 
         if pdb_paths_to_view:
-            molstar_key = "mol_viewer_" + "_".join(
-                sorted([Path(p).stem for p in pdb_paths_to_view])
-            )
-            st_molstar_auto(pdb_paths_to_view, key=molstar_key, height="600px")
+            render_molstar_browser(pdb_paths_to_view)
 
             st.checkbox(
                 "Auto next on 👍/👎 click",
@@ -1665,4 +2178,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        from streamlit.runtime.scriptrunner_utils.script_run_context import (
+            get_script_run_ctx,
+        )
+        ctx = get_script_run_ctx(suppress_warning=True)
+    except Exception:
+        ctx = None
+    if ctx is not None:
+        main()
+    else:
+        import sys
+        from streamlit.web import cli as stcli
+        sys.argv = ["streamlit", "run", __file__, *sys.argv[1:]]
+        sys.exit(stcli.main())

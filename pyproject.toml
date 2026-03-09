@@ -15,7 +15,6 @@ dependencies = [
     "pandas",
     "seaborn",
     "matplotlib",
-    "streamlit-molstar",
     "altair>=5.2.0",
 ]
 
