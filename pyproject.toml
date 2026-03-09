@@ -16,13 +16,14 @@ dependencies = [
     "seaborn",
     "matplotlib",
     "altair>=5.2.0",
+    "biopython",
 ]
 
 [project.optional-dependencies]
 dev = ["black", "isort", "flake8"]
 
 [project.scripts]
-nf-binder-vis = "nf_binder_vis.app:main"
+nf-binder-vis = "nf_binder_vis.app:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nf_binder_vis"]

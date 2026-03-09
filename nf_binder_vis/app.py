@@ -1396,7 +1396,30 @@ def plot_scatter(df: pd.DataFrame, x_col: str, y_col: str) -> Optional[Any]:
     return chart_event
 
 
+def run() -> None:
+    """Entry point for the nf-binder-vis console script. Strips uvx-leading '--', then
+    re-execs via streamlit run when not already in a Streamlit script context.
+    """
+    if len(sys.argv) > 1 and sys.argv[1] == "--":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+    try:
+        from streamlit.runtime.scriptrunner_utils.script_run_context import (
+            get_script_run_ctx,
+        )
+        ctx = get_script_run_ctx(suppress_warning=True)
+    except Exception:
+        ctx = None
+    if ctx is not None:
+        main()
+    else:
+        from streamlit.web import cli as stcli
+        sys.argv = ["streamlit", "run", __file__, "--", *sys.argv[1:]]
+        sys.exit(stcli.main())
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
     # Set up page config for wide mode and collapsed sidebar
     st.set_page_config(
         page_title="nf-binder-vis", layout="wide", initial_sidebar_state="collapsed"
@@ -2285,17 +2308,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        from streamlit.runtime.scriptrunner_utils.script_run_context import (
-            get_script_run_ctx,
-        )
-        ctx = get_script_run_ctx(suppress_warning=True)
-    except Exception:
-        ctx = None
-    if ctx is not None:
-        main()
-    else:
-        import sys
-        from streamlit.web import cli as stcli
-        sys.argv = ["streamlit", "run", __file__, *sys.argv[1:]]
-        sys.exit(stcli.main())
+    run()
