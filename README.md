@@ -33,7 +33,7 @@ This project uses `uv` for Python package management and virtual environment han
 # curl -LsSf https://astral.sh/uv/install.sh | sh
 # export PATH=~/.local/bin:${PATH}
 
-uvx git+https://github.com/Australian-Protein-Design-Initiative/nf-binder-vis.git -- --path /path/to/results
+uvx git+https://github.com/Australian-Protein-Design-Initiative/nf-binder-vis.git --path /path/to/results
 ```
 
 #### Running from a clone of the repository:
@@ -51,7 +51,7 @@ Run using `uv run`:
 
 
 # Run with uv (recommended, from repo)
-uv run nf_binder_vis/app.py -- --path /path/to/results
+uv run nf_binder_vis/app.py --path /path/to/results
 ```
 
 The app will automatically detect and displays results from `nf-binder-design` runs for BindCraft, RFdiffusion and BoltzGen workflows. By default, it will be available at http://localhost:8501/.

@@ -7,6 +7,7 @@
 #     "pandas",
 #     "seaborn",
 #     "streamlit>=1.32.0",
+#     "biopython",
 # ]
 # ///
 
