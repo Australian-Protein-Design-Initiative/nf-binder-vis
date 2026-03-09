@@ -32,4 +32,4 @@ ENV STREAMLIT_SERVER_HEADLESS=true
 WORKDIR /app
 
 # Run streamlit app
-ENTRYPOINT ["streamlit", "run", "/app/app.py"]
+ENTRYPOINT ["streamlit", "run", "/app/nf_binder_vis/app.py"]

@@ -17,7 +17,7 @@ This tool is designed to streamline manual screening of top scoring protein bind
 
 - Run `nf-binder-design` or BindCraft to generate high scoring designs 
   - _(you'll need the PDBs and `combined_scores.tsv` or `final_design_stats.csv` in the folder structure these pipelines output)_
-- Run `app.py` to visualize and manually select the top scoring designs based on your own criteria.
+- Run the app (e.g. `nf-binder-vis` or `uv run streamlit run nf_binder_vis/app.py`) to visualize and manually select the top scoring designs based on your own criteria.
 - Generate sequences to order for gene synthesis of the 'good' designs - see [`scripts/binder_prep`](scripts/binder_prep/README.md).
 
 ## Installation
@@ -26,6 +26,18 @@ This project uses `uv` for Python package management and virtual environment han
 
 ### Quickstart
 
+#### Running directly from GitHub with `uvx`:
+
+```bash
+# Install uv, if you don't have it
+# curl -LsSf https://astral.sh/uv/install.sh | sh
+# export PATH=~/.local/bin:${PATH}
+
+uvx git+https://github.com/Australian-Protein-Design-Initiative/nf-binder-vis.git -- --path /path/to/results
+```
+
+#### Running from a clone of the repository:
+
 Clone the Repository:
 
 ```bash
@@ -33,18 +45,16 @@ git clone https://github.com/Australian-Protein-Design-Initiative/nf-binder-vis.
 cd nf-binder-vis
 ```
 
-Run using `uv`:
+Run using `uv run`:
 
 ```bash
-# Install uv, if you don't have it
-# curl -LsSf https://astral.sh/uv/install.sh | sh
-# export PATH=~/.local/bin:${PATH}
 
-# Run with uv (recommended)
-uv run streamlit run app.py -- --path /path/to/results
+
+# Run with uv (recommended, from repo)
+uv run nf_binder_vis/app.py -- --path /path/to/results
 ```
 
-The app will automatically detect and displays results from `nf-binder-design` runs for both BindCraft and RFdiffusion workflows. By default, it will be available at http://localhost:8501/.
+The app will automatically detect and displays results from `nf-binder-design` runs for BindCraft, RFdiffusion and BoltzGen workflows. By default, it will be available at http://localhost:8501/.
 
 ## Building a Docker/Apptainer Image
 
